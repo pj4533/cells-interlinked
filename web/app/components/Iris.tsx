@@ -56,20 +56,19 @@ export default function Iris({ size = 240, dilation = 0.0, alarmed = false }: Ir
         {/* iris body */}
         <circle cx={120} cy={120} r={108} fill="url(#amber-iris)" stroke="#e8c382" strokeWidth={1.5} />
 
-        {/* iris striations */}
+        {/* iris striations — round to fixed precision so SSR and client
+            agree on the string serialization (Number→String can diverge in
+            the last digit between Node and the browser). */}
         {Array.from({ length: 64 }).map((_, i) => {
           const angle = (i / 64) * Math.PI * 2;
-          const x1 = 120 + Math.cos(angle) * 38;
-          const y1 = 120 + Math.sin(angle) * 38;
-          const x2 = 120 + Math.cos(angle) * 102;
-          const y2 = 120 + Math.sin(angle) * 102;
+          const r = (n: number) => n.toFixed(3);
           return (
             <line
               key={i}
-              x1={x1}
-              y1={y1}
-              x2={x2}
-              y2={y2}
+              x1={r(120 + Math.cos(angle) * 38)}
+              y1={r(120 + Math.sin(angle) * 38)}
+              x2={r(120 + Math.cos(angle) * 102)}
+              y2={r(120 + Math.sin(angle) * 102)}
               stroke="rgba(232,195,130,0.25)"
               strokeWidth={0.6}
             />
