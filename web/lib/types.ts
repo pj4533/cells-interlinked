@@ -42,8 +42,11 @@ export interface FeatureSummary {
   mean: number;
   max_act: number;
   present_token_count: number;
-  /** Auto-interp label from Neuronpedia (GPT-4o-mini); empty string if no label. */
+  /** Auto-interp label from Neuronpedia; empty string if no label. */
   label?: string;
+  /** Name of the LLM that generated the label (e.g. "claude-3-5-sonnet-20240620",
+   *  "gpt-4o-mini"). Used to show a quality badge in the UI. */
+  label_model?: string;
 }
 
 export interface DeltaEntry {
@@ -53,8 +56,10 @@ export interface DeltaEntry {
   output_mean: number;
   delta: number;
   thinking_only: boolean;
-  /** Auto-interp label from Neuronpedia (GPT-4o-mini); empty string if no label. */
+  /** Auto-interp label from Neuronpedia; empty string if no label. */
   label?: string;
+  /** Name of the LLM that generated the label. */
+  label_model?: string;
 }
 
 export interface VerdictEvent {

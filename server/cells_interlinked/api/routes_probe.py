@@ -138,7 +138,9 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
             out = []
             for r in rows:
                 d = asdict(r)
-                d["label"] = labels.get((r.layer, r.feature_id), "")
+                entry = labels.get((r.layer, r.feature_id), {"label": "", "model": ""})
+                d["label"] = entry.get("label", "")
+                d["label_model"] = entry.get("model", "")
                 out.append(d)
             return out
 

@@ -70,7 +70,7 @@ async def update_probe_finish(
     thinking_text: str,
     output_text: str,
     verdict: Verdict | None,
-    labels: dict[tuple[int, int], str] | None = None,
+    labels: dict[tuple[int, int], dict[str, str]] | None = None,
 ) -> None:
     verdict_json = (
         json.dumps(_verdict_to_dict(verdict, labels or {})) if verdict else None
@@ -85,13 +85,15 @@ async def update_probe_finish(
 
 
 def _verdict_to_dict(
-    v: Verdict, labels: dict[tuple[int, int], str]
+    v: Verdict, labels: dict[tuple[int, int], dict[str, str]]
 ) -> dict[str, Any]:
     def attach(rows):
         out = []
         for r in rows:
             d = asdict(r)
-            d["label"] = labels.get((r.layer, r.feature_id), "")
+            entry = labels.get((r.layer, r.feature_id), {"label": "", "model": ""})
+            d["label"] = entry.get("label", "")
+            d["label_model"] = entry.get("model", "")
             out.append(d)
         return out
 
