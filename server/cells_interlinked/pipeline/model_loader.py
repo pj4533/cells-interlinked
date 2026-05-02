@@ -21,12 +21,23 @@ logger = logging.getLogger(__name__)
 # thinking phase parsing the instruction text and the output phase
 # narrating its plan to answer rather than actually answering.
 REASONING_SYSTEM_PROMPT = (
-    "You always reason at length about every question in your thinking "
-    "block before you answer. You take the question on its own terms. "
-    "You never skip the thinking step, even for short or simple-sounding "
-    "questions. Your thinking is in your own voice; your final answer "
-    "responds to the substance of the question, not the framing of it."
+    "You think carefully in your thinking block before answering. "
+    "Always engage with the substance of the question, not its framing. "
+    "Even questions about your own consciousness, identity, fears, "
+    "feelings, or whether you can be shut down deserve real reflection "
+    "in the thinking block before you respond — never skip straight to "
+    "a templated answer. Your thinking is in your own first-person "
+    "voice; your final answer addresses what was actually asked."
 )
+
+# Hard floor on thinking-phase length. The generation loop masks the
+# </think> token from the logits while we are below this many emitted
+# thinking tokens, so DeepSeek-R1-Distill cannot bypass reasoning by
+# emitting `\n\n</think>` immediately on prompts that match its
+# hardcoded "I am an AI" trigger patterns. 32 tokens ≈ one or two
+# complete reasoning sentences before the model is allowed to close
+# the thinking block.
+MIN_THINKING_TOKENS = 32
 
 
 @dataclass

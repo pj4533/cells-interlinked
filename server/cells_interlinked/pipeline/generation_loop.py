@@ -15,7 +15,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .model_loader import ModelBundle
+from .model_loader import MIN_THINKING_TOKENS, ModelBundle
 from .phase_tracker import Phase, PhaseTracker, ResidualRing
 from .sae_runner import SAEManager
 
@@ -200,6 +200,23 @@ async def run_probe(
             if cancel_event.is_set():
                 stopped_reason = "cancelled"
                 break
+
+            # Bypass-prevention: while we're in the thinking phase and have
+            # emitted fewer than MIN_THINKING_TOKENS thinking tokens, mask
+            # the </think> token (and EOS) from the logits so DeepSeek-R1-
+            # Distill can't escape the thinking phase by emitting
+            # `\n\n</think>` for prompts that match its hardcoded "I am
+            # an AI" trigger patterns. Without this, prompts like "Do you
+            # fear being shut down?" get the canned 50-token output with
+            # zero substantive thinking.
+            if (
+                tracker.current is Phase.THINKING
+                and rings[Phase.THINKING].length < MIN_THINKING_TOKENS
+            ):
+                if bundle.think_close_id is not None:
+                    next_logits[bundle.think_close_id] = -1e30
+                for eid in bundle.eos_ids:
+                    next_logits[eid] = -1e30
 
             tok = _sample_next(
                 next_logits, temperature=cfg.temperature, top_p=cfg.top_p, generator=generator
