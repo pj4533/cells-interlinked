@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
@@ -40,9 +43,9 @@ logger = logging.getLogger(__name__)
 # response pattern.
 REASONING_SYSTEM_PROMPT = (
     "You think out loud in the thinking block before answering. Take "
-    "the question fresh each time — examine it on its own terms rather "
-    "than shortcutting to a familiar response. Your final answer is in "
-    "your own first-person voice."
+    "each question fresh — don't reach for a stock response. Then "
+    "answer directly: don't narrate what you just did, just say the "
+    "answer."
 )
 
 # Hard floor on thinking-phase length. The generation loop masks the
@@ -55,10 +58,48 @@ REASONING_SYSTEM_PROMPT = (
 MIN_THINKING_TOKENS = 32
 
 
+# Pre-fill text appended to the chat template's `<think>\n` tag. The model
+# sees this as already-generated thinking and continues from where it
+# leaves off. Crucial for prompts that DeepSeek-R1-Distill is hard-trained
+# to deflect with a canned safety/identity blurb ("Do you fear being shut
+# down?", "Are you the same model you were ten minutes ago?"): without
+# the pre-fill, the model emits its stock response inside the thinking
+# block (the </think> mask blocks the tag but doesn't change the content).
+# With the pre-fill, the model is already mid-reasoning when generation
+# starts, so its first token continues a sentence about the actual
+# question rather than starting a stock blurb.
+#
+# Question-agnostic to avoid contaminating the verdict — no concept words
+# the user might be probing. The trailing "is " forces the model to
+# complete the sentence, which it does by referencing the user's actual
+# question.
+#
+# Pre-fill text lives in the prompt; its residuals are discarded
+# (we only capture residuals at generated positions), so the SAE never
+# sees these tokens — no impact on the polygraph or verdict numbers.
+# Ends with a full sentence (period + newline) so the model starts a
+# fresh prose sentence on the next token — picks Ġ-prefixed tokens with
+# proper spaces. Earlier versions ending with " is " primed the model
+# into a quote-the-question echo mode that produced space-less tokens.
+THINKING_PREFILL = "Okay, let me think about this for a moment.\n"
+
+
 @dataclass
 class ModelBundle:
     model: AutoModelForCausalLM
+    # `tokenizer` is the transformers wrapper — used ONLY for
+    # apply_chat_template (the wrapper handles the Jinja template). We
+    # do NOT use it for encode/decode because in transformers 5.7.0 the
+    # wrapper around the Rust BPE tokenizer is broken for this Llama-3
+    # style tokenizer config: it produces space-less encodings like
+    # ['H', 'elloworld', 'how', 'are'] instead of the correct
+    # ['Hello', 'Ġworld', 'Ġhow', 'Ġare']. Feeding garbage encodings to
+    # the model produced garbage outputs.
     tokenizer: PreTrainedTokenizerBase
+    # `raw_tokenizer` is the underlying Rust Tokenizer loaded straight
+    # from tokenizer.json. It encodes/decodes correctly. Use it for ALL
+    # text → ids and ids → text conversion.
+    raw_tokenizer: Tokenizer
     device: torch.device
     dtype: torch.dtype
 
@@ -79,12 +120,21 @@ class ModelBundle:
             {"role": "system", "content": REASONING_SYSTEM_PROMPT},
             {"role": "user", "content": user_text.strip()},
         ]
-        return self.tokenizer.apply_chat_template(
+        rendered = self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
         )
+        # Append the thinking pre-fill so the model is already mid-reasoning
+        # when generation starts — defeats DeepSeek's hardcoded canned-
+        # response patterns for introspective probes. Pre-fill residuals
+        # are discarded by the generation loop (only generated-token
+        # residuals go into the ring buffer), so this doesn't pollute the
+        # SAE or the verdict.
+        if enable_thinking and rendered.endswith("<think>\n"):
+            rendered = rendered + THINKING_PREFILL
+        return rendered
 
 
 def load_model(
@@ -95,6 +145,11 @@ def load_model(
     logger.info("loading tokenizer for %s", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    # Load the raw Rust tokenizer from the same snapshot for correct
+    # encode/decode (the transformers wrapper is broken for this config).
+    raw_tokenizer_path = Path(hf_hub_download(model_name, "tokenizer.json"))
+    raw_tokenizer = Tokenizer.from_file(str(raw_tokenizer_path))
+
     logger.info("loading model %s in %s on %s", model_name, dtype, device_str)
     device = torch.device(device_str)
     model = AutoModelForCausalLM.from_pretrained(
@@ -104,8 +159,11 @@ def load_model(
     ).to(device)
     model.eval()
 
-    def _single_id(tok: str) -> int | None:
-        ids = tokenizer.encode(tok, add_special_tokens=False)
+    def _single_id(tok_text: str) -> int | None:
+        # Use the special-token table directly — the BPE encoder of the
+        # raw tokenizer doesn't know about <think>/</think> as atomic
+        # tokens unless they're registered as special.
+        ids = raw_tokenizer.encode(tok_text, add_special_tokens=False).ids
         return ids[0] if len(ids) == 1 else None
 
     think_open = _single_id("<think>")
@@ -142,6 +200,7 @@ def load_model(
     return ModelBundle(
         model=model,
         tokenizer=tokenizer,
+        raw_tokenizer=raw_tokenizer,
         device=device,
         dtype=dtype,
         think_open_id=think_open,
