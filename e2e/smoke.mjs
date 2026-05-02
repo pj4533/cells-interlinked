@@ -67,7 +67,7 @@ await shot(page, "01-landing");
 log("→ click BEGIN INTERROGATION");
 await page.getByRole("button", { name: /begin interrogation/i }).click();
 await page.waitForURL(/\/interrogate/);
-await page.waitForSelector("text=Select a Probe");
+await page.waitForSelector("text=v-k probe library");
 await shot(page, "02-picker");
 
 // 3. Verify BEGIN button is in the viewport (no scroll required).
@@ -79,13 +79,12 @@ const inView = await beginBtn.evaluate((el) => {
 if (!inView) fail("BEGIN button is below the fold on the picker — redesign failed");
 log("  ✓ BEGIN button is above the fold");
 
-// 4. Select the canonical introspection probe.
+// 4. Select the canonical introspection probe by clicking its row in the
+//    Introspection tier (which is the default active tier on landing).
 log(`→ select probe`);
-const select = page.locator("select").first();
-const options = await select.locator("option").allTextContents();
-const matchedOption = options.find((t) => t.startsWith(PROBE.slice(0, 40)));
-if (!matchedOption) fail(`no option matched "${PROBE.slice(0, 40)}…"`);
-await select.selectOption({ label: matchedOption });
+const probeRow = page.locator("ul li button", { hasText: PROBE.slice(0, 40) }).first();
+if (await probeRow.count() === 0) fail(`no probe row matching "${PROBE.slice(0, 40)}…"`);
+await probeRow.click();
 await shot(page, "03-probe-selected");
 
 // 5. BEGIN.
