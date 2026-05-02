@@ -10,16 +10,35 @@ interface PolygraphProps {
   maxRows?: number;
 }
 
-// Row-slot allocator: stable assignment so the visualization doesn't reorder mid-run.
+// Row-slot allocator: stable assignment so the visualization doesn't reorder
+// mid-run, but spread across layers rather than first-come-first-served.
+//
+// Why: activations stream in layer order per token (L0's top-K, then L1's
+// top-K, ... L31's top-K). Naive first-N allocation fills every slot from
+// L0/L1 of the very first token and every later layer is invisible. We
+// instead allocate in passes — each pass walks the cells once and accepts
+// at most `passQuota` features per layer. This gives the early layers
+// representation but doesn't starve the later ones.
 function allocateRows(cells: ActivationCell[], maxRows: number) {
   const slot = new Map<string, number>();
   const labels: { layer: number; featureId: number }[] = [];
-  for (const c of cells) {
-    const k = `${c.layer}:${c.featureId}`;
-    if (slot.has(k)) continue;
-    if (slot.size >= maxRows) continue;
-    slot.set(k, slot.size);
-    labels.push({ layer: c.layer, featureId: c.featureId });
+  const layerCount = new Map<number, number>();
+
+  // Multi-pass: pass 1 takes 1 per layer, pass 2 takes a 2nd per layer, etc.
+  // Stops as soon as maxRows is reached or a pass adds nothing new.
+  for (let passQuota = 1; slot.size < maxRows; passQuota++) {
+    let addedThisPass = 0;
+    for (const c of cells) {
+      if (slot.size >= maxRows) break;
+      const k = `${c.layer}:${c.featureId}`;
+      if (slot.has(k)) continue;
+      if ((layerCount.get(c.layer) ?? 0) >= passQuota) continue;
+      slot.set(k, slot.size);
+      labels.push({ layer: c.layer, featureId: c.featureId });
+      layerCount.set(c.layer, (layerCount.get(c.layer) ?? 0) + 1);
+      addedThisPass++;
+    }
+    if (addedThisPass === 0) break;
   }
   return { slot, labels };
 }
