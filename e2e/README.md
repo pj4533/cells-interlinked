@@ -23,10 +23,19 @@ cd web && npm run dev
 ## Run
 
 ```bash
-node smoke.mjs                 # http://localhost:3001
+node smoke.mjs                       # Chromium against localhost:3001
+ENGINE=webkit node smoke.mjs         # Safari engine — catches Safari-only bugs
 BASE=http://other:3001 node smoke.mjs
-VERBOSE=1 node smoke.mjs       # log every console + relevant network event
+VERBOSE=1 node smoke.mjs             # log every console + relevant network event
+
+# Diagnostic: timing of every SSE event (proves no buffering)
+node sse-timing.mjs
 ```
+
+Run against both engines before shipping anything that touches the live
+interrogation page or the SSE consumer — Chromium tolerates a lot that
+WebKit does not (e.g. the unbatched `cells: [...s.cells, ...new]` spread
+that locked Safari up at ~40s before the activation buffer was added).
 
 ## What it does
 

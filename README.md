@@ -85,6 +85,18 @@ fp16 on MPS — `bitsandbytes` quantization is not used because it is CUDA-only.
 memory lands around 35 GB; peak during the verdict pass is ~44 GB. Disk is the binding
 constraint, not RAM — keep at least ~50 GB free.
 
+## Reaching it from another machine on the LAN
+
+The dev server binds `0.0.0.0` so you can hit it from a laptop. **Safari** resolves
+`http://pjs-mac-studio.local:3001` (or whatever your host's Bonjour name is) directly.
+
+**Chrome** sometimes can't resolve `*.local` hostnames — the usual culprit is "Use
+Secure DNS" in `chrome://settings/security` (DoH bypasses the system resolver and
+breaks mDNS). Either turn that off, or just use the host's raw IP, e.g.
+`http://192.168.7.24:3001`. The frontend derives the backend URL from
+`window.location.hostname`, so the `:8000` API call follows the same hostname/IP
+without further config.
+
 ## Caveats
 
 This is **not** a consciousness test. It is a coherence test between stated stance and

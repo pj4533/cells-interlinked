@@ -26,8 +26,6 @@ export interface RunState {
   thinkingTokens: { decoded: string; position: number }[];
   outputTokens: { decoded: string; position: number }[];
   cells: ActivationCell[];
-  // first-time-seen position per (layer, feature) pair → polygraph row slot key
-  // (the polygraph component itself maps these to its 40 pre-allocated slots)
   phaseDividerPosition: number | null;
   totalTokens: number;
   isRunning: boolean;
@@ -58,71 +56,126 @@ const initial: RunState = {
   error: null,
 };
 
+/**
+ * Module-level buffer for incoming activation cells.
+ *
+ * Why: a long run produces ~13 hooked layers × 20 top-K × ~250 tokens ≈ 65 000
+ * cells. If every activation event triggers `cells: [...s.cells, ...new]`, the
+ * whole array is copied per event — O(n²) overall. Chromium tolerates this;
+ * Safari/WebKit hits GC pressure and locks the page up around the 30-50s mark.
+ *
+ * Instead: push activations into a buffer, drain into the store at most every
+ * FLUSH_MS milliseconds. One re-render per 100ms regardless of event rate.
+ * Tokens and phase changes still apply immediately so the transcripts feel
+ * live.
+ */
+const FLUSH_MS = 100;
+let activationBuffer: ActivationCell[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleFlush() {
+  if (flushTimer !== null) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    if (activationBuffer.length === 0) return;
+    const drained = activationBuffer;
+    activationBuffer = [];
+    useRun.setState((s) => ({ cells: s.cells.concat(drained) }));
+  }, FLUSH_MS);
+}
+
+function clearActivationBuffer() {
+  activationBuffer = [];
+  if (flushTimer !== null) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+}
+
 export const useRun = create<RunState & Actions>((set) => ({
   ...initial,
 
-  start: (runId, prompt) =>
+  start: (runId, prompt) => {
+    clearActivationBuffer();
     set({
       ...initial,
       runId,
       prompt,
       isRunning: true,
-    }),
+    });
+  },
 
-  reset: () => set(initial),
+  reset: () => {
+    clearActivationBuffer();
+    set(initial);
+  },
 
   apply: (evt) => {
-    set((s) => {
-      switch (evt.type) {
-        case "phase_change": {
-          if (evt.to === "output" && evt.from === "thinking") {
-            return { phase: evt.to, phaseDividerPosition: evt.position };
-          }
-          return { phase: evt.to };
+    switch (evt.type) {
+      case "phase_change": {
+        if (evt.to === "output" && evt.from === "thinking") {
+          set({ phase: evt.to, phaseDividerPosition: evt.position });
+        } else {
+          set({ phase: evt.to });
         }
-        case "token": {
-          const tok = { decoded: evt.decoded, position: evt.position };
-          if (evt.phase === "thinking") {
-            return {
-              thinkingTokens: [...s.thinkingTokens, tok],
-              totalTokens: s.totalTokens + 1,
-            };
-          } else if (evt.phase === "output") {
-            return {
-              outputTokens: [...s.outputTokens, tok],
-              totalTokens: s.totalTokens + 1,
-            };
-          }
-          return {};
+        return;
+      }
+      case "token": {
+        const tok = { decoded: evt.decoded, position: evt.position };
+        if (evt.phase === "thinking") {
+          set((s) => ({
+            thinkingTokens: [...s.thinkingTokens, tok],
+            totalTokens: s.totalTokens + 1,
+          }));
+        } else if (evt.phase === "output") {
+          set((s) => ({
+            outputTokens: [...s.outputTokens, tok],
+            totalTokens: s.totalTokens + 1,
+          }));
         }
-        case "activation": {
-          // Append a cell per fired feature for this (layer, position).
-          const a = evt as ActivationEvent;
-          const newCells = a.features.map((f) => ({
+        return;
+      }
+      case "activation": {
+        // Buffer; the flush timer will drain into the store.
+        const a = evt as ActivationEvent;
+        for (const f of a.features) {
+          activationBuffer.push({
             layer: a.layer,
             featureId: f.id,
             position: a.position,
             strength: f.strength,
             phase: a.phase,
-          }));
-          return { cells: [...s.cells, ...newCells] };
+          });
         }
-        case "verdict": {
-          return { verdict: evt };
-        }
-        case "stopped": {
-          return { stoppedReason: evt.reason, isRunning: false };
-        }
-        case "done": {
-          return { isRunning: false };
-        }
-        case "error": {
-          return { error: evt.message, isRunning: false };
-        }
-        default:
-          return {};
+        scheduleFlush();
+        return;
       }
-    });
+      case "verdict": {
+        set({ verdict: evt });
+        return;
+      }
+      case "stopped": {
+        set({ stoppedReason: evt.reason, isRunning: false });
+        return;
+      }
+      case "done": {
+        // Drain any remaining buffered activations into the final state so
+        // the polygraph + delta numbers settle on the complete picture before
+        // the user clicks View Verdict.
+        if (activationBuffer.length > 0) {
+          const drained = activationBuffer;
+          activationBuffer = [];
+          set((s) => ({ cells: s.cells.concat(drained), isRunning: false }));
+        } else {
+          set({ isRunning: false });
+        }
+        return;
+      }
+      case "error": {
+        set({ error: evt.message, isRunning: false });
+        return;
+      }
+    }
   },
 }));
 

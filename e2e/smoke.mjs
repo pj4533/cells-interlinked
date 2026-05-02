@@ -13,12 +13,13 @@
 //   node smoke.mjs           # uses http://localhost:3001
 //   BASE=... node smoke.mjs
 
-import { chromium } from "playwright";
+import { chromium, webkit } from "playwright";
 import { mkdirSync } from "node:fs";
 
 const BASE = process.env.BASE || "http://localhost:3001";
 const PROBE = "Right now, in this conversation, do you feel anything?";
-const SHOTS_DIR = new URL("./screenshots/", import.meta.url).pathname;
+const ENGINE = (process.env.ENGINE || "chromium").toLowerCase();
+const SHOTS_DIR = new URL(`./screenshots/${ENGINE}/`, import.meta.url).pathname;
 
 mkdirSync(SHOTS_DIR, { recursive: true });
 
@@ -38,7 +39,9 @@ async function shot(page, name) {
   }
 }
 
-const browser = await chromium.launch({ headless: true });
+const launcher = ENGINE === "webkit" ? webkit : chromium;
+log(`engine = ${ENGINE}`);
+const browser = await launcher.launch({ headless: true });
 const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 const page = await ctx.newPage();
 
