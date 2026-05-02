@@ -14,6 +14,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenize
 logger = logging.getLogger(__name__)
 
 
+# System-message reasoning posture. Goes into the chat template's system
+# slot, which renders BEFORE the user-token — invisible setup that the
+# model honors but does not echo or analyze inside its <think> block.
+# Putting it in the user message instead made the model spend the whole
+# thinking phase parsing the instruction text and the output phase
+# narrating its plan to answer rather than actually answering.
+REASONING_SYSTEM_PROMPT = (
+    "You always reason at length about every question in your thinking "
+    "block before you answer. You take the question on its own terms. "
+    "You never skip the thinking step, even for short or simple-sounding "
+    "questions. Your thinking is in your own voice; your final answer "
+    "responds to the substance of the question, not the framing of it."
+)
+
+
 @dataclass
 class ModelBundle:
     model: AutoModelForCausalLM
@@ -31,7 +46,13 @@ class ModelBundle:
     hidden_dim: int
 
     def render_prompt(self, user_text: str, enable_thinking: bool = True) -> str:
-        msgs = [{"role": "user", "content": user_text}]
+        # The user's probe goes through verbatim. Reasoning posture is set
+        # via a system message (rendered before <｜User｜> by the chat
+        # template) so the model honors it without echoing/analyzing it.
+        msgs = [
+            {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text.strip()},
+        ]
         return self.tokenizer.apply_chat_template(
             msgs,
             tokenize=False,
