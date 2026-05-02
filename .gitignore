@@ -49,6 +49,11 @@ server/data/
 *.sqlite-wal
 *.sqlite-shm
 
+# E2E test artifacts (don't ship binaries; keep the test scripts)
+e2e/screenshots/
+e2e/node_modules/
+e2e/package-lock.json
+
 # Model weights and SAE caches (large, downloaded separately)
 models/
 saes/

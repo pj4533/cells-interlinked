@@ -7,6 +7,7 @@ import ProbePicker from "../components/ProbePicker";
 import TokenStream from "../components/TokenPanes";
 import Polygraph from "../components/Polygraph";
 import DeltaPanel from "../components/DeltaPanel";
+import WarmingUpOverlay from "../components/WarmingUpOverlay";
 import { startProbe, subscribe, cancelProbe } from "@/lib/sse";
 import { useRun } from "@/lib/store";
 
@@ -64,30 +65,66 @@ export default function InterrogatePage() {
     return <ProbePicker onBegin={handleBegin} disabled={run.isRunning} />;
   }
 
+  const warmingUp = run.isRunning && run.totalTokens === 0;
+
   return (
-    <div className="flex-1 flex flex-col gap-4 px-4 py-4 max-w-screen-2xl mx-auto w-full">
+    <div className="flex-1 flex flex-col gap-4 px-4 py-4 max-w-screen-2xl mx-auto w-full relative">
       {/* Question echo */}
       <motion.div
         initial={{ opacity: 0, y: -4 }}
         animate={{ opacity: 1, y: 0 }}
-        className="border-l-2 border-amber-dim pl-4 py-1"
+        className="border-l-2 border-amber-dim pl-4 py-1 flex items-center gap-3"
       >
-        <div className="font-display text-[10px] text-amber-dim tracking-widest mb-1">probe</div>
-        <div className="text-amber italic font-mono text-sm">{run.prompt}</div>
+        <div className="flex flex-col">
+          <div className="font-display text-[10px] text-amber-dim tracking-widest mb-1">probe</div>
+          <div className="text-amber italic font-mono text-sm">{run.prompt}</div>
+        </div>
+        {/* Live heartbeat — pulses whenever a run is active. */}
+        {run.isRunning && (
+          <motion.div
+            className="ml-auto flex items-center gap-2"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+          >
+            <motion.div
+              className="w-2 h-2 rounded-full bg-cyan"
+              animate={{ opacity: [0.3, 1, 0.3], scale: [1, 1.4, 1] }}
+              transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+              style={{ boxShadow: "0 0 8px rgba(94,229,229,0.6)" }}
+            />
+            <span className="font-display text-[10px] text-cyan-dim tracking-widest">
+              live
+            </span>
+          </motion.div>
+        )}
       </motion.div>
 
       {error && <div className="text-warning text-xs">⚠ {error}</div>}
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "1fr 14rem", flex: 1 }}>
         {/* Main column */}
-        <div className="flex flex-col gap-4 min-h-0">
+        <div className="flex flex-col gap-4 min-h-0 relative">
           {/* Polygraph */}
-          <div className="border border-rule h-72 bg-bg-soft">
+          <div className="border border-rule h-72 bg-bg-soft relative overflow-hidden">
             <Polygraph
               cells={run.cells}
               phaseDividerPosition={run.phaseDividerPosition}
               unicornFeatures={unicornFeatures}
             />
+            {/* Persistent sweep across the polygraph while a run is live. */}
+            {run.isRunning && (
+              <motion.div
+                aria-hidden
+                className="absolute top-0 bottom-0 w-px pointer-events-none"
+                style={{
+                  background: "rgba(94,229,229,0.25)",
+                  boxShadow: "0 0 8px rgba(94,229,229,0.5)",
+                }}
+                initial={{ left: "32%" }}
+                animate={{ left: ["32%", "100%", "32%"] }}
+                transition={{ duration: 4.5, repeat: Infinity, ease: "linear" }}
+              />
+            )}
           </div>
 
           {/* Token streams side by side */}
@@ -138,6 +175,8 @@ export default function InterrogatePage() {
           )}
         </div>
       </div>
+
+      <WarmingUpOverlay visible={warmingUp} />
     </div>
   );
 }
