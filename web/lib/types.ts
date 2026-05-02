@@ -42,6 +42,8 @@ export interface FeatureSummary {
   mean: number;
   max_act: number;
   present_token_count: number;
+  /** Auto-interp label from Neuronpedia (GPT-4o-mini); empty string if no label. */
+  label?: string;
 }
 
 export interface DeltaEntry {
@@ -51,6 +53,8 @@ export interface DeltaEntry {
   output_mean: number;
   delta: number;
   thinking_only: boolean;
+  /** Auto-interp label from Neuronpedia (GPT-4o-mini); empty string if no label. */
+  label?: string;
 }
 
 export interface VerdictEvent {

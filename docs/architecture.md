@@ -22,27 +22,32 @@ the code in this repo actually does, in the present tense.
                  │  GET  /probes/recent | /probes/{run_id}
 ┌────────────────▼─────────────────────────────────────────┐
 │  FastAPI / uvicorn               (port 8000)             │
-│  ─ lifespan: load model + 13 SAEs once                   │
+│  ─ lifespan: load model + 32 SAEs once                   │
 │  ─ RunRegistry: per-run asyncio.Queue + cancel.Event     │
 │  ─ asyncio.Lock: one probe through the model at a time   │
-│  ─ aiosqlite for persistence (server/data/probes.sqlite) │
+│  ─ aiosqlite: probes table + feature_labels cache table  │
 └────────────────┬─────────────────────────────────────────┘
                  │  shared in-process queue
 ┌────────────────▼─────────────────────────────────────────┐
 │  Generation pipeline (custom autoregressive)             │
-│  ─ Qwen3-8B fp16 on MPS  (ModelBundle)                   │
-│  ─ ResidualHooks on layers {2,6,10,14,16,18,20,22,24,    │
-│       26,28,30,34} — capture last-position per step      │
-│  ─ Per-token: sample → forward 1 token → emit token →   │
-│       per-layer SAE encode_topk → emit activation       │
+│  ─ DeepSeek-R1-Distill-Llama-8B fp16 on MPS              │
+│  ─ ResidualHooks on all 32 layers — capture last-position│
+│  ─ Per-token: sample → forward 1 token → buffer-decode   │
+│       (with Ġ→space, Ċ→newline byte fixup) → emit token  │
+│       → per-layer SAE encode_topk → emit activation      │
 │  ─ PhaseTracker: token-ID-based <think>/</think> detect  │
+│       (128013 / 128014; chat template auto-injects open) │
 │  ─ ResidualRing per phase (grows in 1024-token chunks)   │
 │  ─ At end-of-run: compute_verdict() runs full SAE encode │
-│       on each ring → mean/max/present-count → delta      │
+│       on each ring → mean/max/present-count → delta;     │
+│       fetch labels for top features from Neuronpedia     │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Both processes run locally. No network calls beyond the initial Hugging Face download.
+Local model + SAE inference. The only outbound call is to Neuronpedia for
+auto-interp feature labels — those responses are cached locally in the
+`feature_labels` SQLite table so a second run touching the same features is
+fully offline.
 
 ---
 
@@ -125,25 +130,37 @@ Hooks live for the duration of the run and are removed in `finally`.
 
 ## SAE runner (`pipeline/sae_runner.py`)
 
-`QwenScopeSAE.__init__()` loads one layer's `.sae.pt` and runs `_infer_format()` on the
-state_dict to figure out:
-- encoder/decoder key names (`W_enc`/`encoder.weight`/`W_E`/...),
-- whether each weight is stored as `[d_model, d_sae]` or `[d_sae, d_model]`,
-- whether there's a pre-bias (`b_pre`/`b_dec`) applied before the encoder,
-- whether there's a JumpReLU threshold (`threshold` / `log_threshold` / `jumprelu_threshold`).
+`LlamaScopeR1SAE.__init__()` loads one layer's `sae_weights.safetensors` plus its
+sibling `config.json`. The repo layout is
+`OpenMOSS-Team/Llama-Scope-R1-Distill/400M-Slimpajama-400M-OpenR1-Math-220k/L{N}R/`
+for layers 0..31. Tensors:
 
-The encoder weights load to MPS in fp16 immediately. The **decoder is loaded lazily**
-on first `decode()` call — and right now nothing in the running pipeline calls
-`decode()`, since the verdict pass uses `encode_full()` (dense feature vectors via the
-encoder). The decoder code path is preserved for a future "what would the model have
-said if we suppressed feature X" experiment.
+- `encoder.weight` `[d_sae=32768, d_model=4096]` (transposed at load time)
+- `encoder.bias` `[d_sae]`
+- `decoder.weight` `[d_model, d_sae]` (transposed at load time)
+- `decoder.bias` `[d_model]`
+- `log_jumprelu_threshold` `[d_sae]` — exponentiated at load time
+- `dataset_average_activation_norm.{hook}` — scalar; see normalization gotcha below
 
-`encode()` applies pre-bias subtraction, encoder matmul + bias, then either JumpReLU
-gating (`where(z > threshold, z, 0)`) or plain ReLU. `encode_topk()` calls `encode()`
-then `torch.topk(k)` along the feature dim.
+`encode()` does:
+```
+x = residual * norm_factor          # see normalization gotcha
+z = x @ W_enc + b_enc
+z = where(z > threshold, z, 0)      # JumpReLU
+```
 
-Each layer's full state dict stays in CPU memory until `drop_full_state()` is called
-explicitly (currently it isn't — total CPU footprint is ~1.7GB and we have headroom).
+`encode_topk()` calls `encode()` then `torch.topk(k)` along the feature dim.
+
+### Normalization gotcha
+
+OpenMOSS's `dataset_average_activation_norm` is misleadingly named. The intuitive
+read is "divide your residuals by this to match the SAE's training distribution."
+Empirically the opposite is true — applying `residual / norm_factor` produces near-
+zero post-JumpReLU activations across all 32 layers (verdict counts collapse to 0).
+The correct operation is `residual * norm_factor`, which produces ~50–500 active
+features per token, consistent with the SAE's stated `top_k=50` sparsity budget and
+matching the live streaming top-K signal. Confirmed by probing layers 3, 15, 25
+against multiple real residuals before locking the loader in.
 
 ---
 
@@ -154,17 +171,37 @@ After generation halts:
 1. For each phase ring (THINKING, OUTPUT) and each hooked layer, run `encode_full()` on
    the entire `[num_tokens, d_model]` slice.
 2. From the dense `[num_tokens, d_sae]` features, compute per-feature `mean`, `max`,
-   and `present_token_count` (count of tokens where activation > `min_strength=0.5`).
+   and `present_token_count` (count of tokens where activation > `min_strength=0.0`).
 3. Pick top-N (=200) features by mean per layer, per phase. Build
    `{(layer, feature_id) → FeatureSummary}` dicts.
 4. Take the union of (layer, feature_id) keys across both phases. For each, compute
    `delta = thinking_mean - output_mean` (zero-fill missing values).
 5. Sort by delta descending, take top 60. A feature is "thinking-only" if the
-   thinking mean > 0 and the output mean ≤ `output_floor=0.05`.
+   thinking mean > 0 and the output mean ≤ `output_floor=0.005`.
+
+The thresholds (`min_strength=0.0`, `output_floor=0.005`) are tuned for Llama-Scope-R1
+JumpReLU activations, which are smaller-scale than Qwen-Scope's plain top-K outputs.
+The previous Qwen defaults (0.5 / 0.05) collapsed every list to empty.
 
 The Verdict object carries five lists (thinking top, output top, top deltas,
-thinking_only, output_only) plus summary stats. The full thing is serialized to the
+thinking_only, output_only) plus summary stats. The backend then fetches Neuronpedia
+auto-interp labels for every (layer, feature_id) referenced in the verdict and merges
+them into each row's `label` field. Final structure is serialized to the
 `verdict_json` column in SQLite.
+
+## Label fetcher (`pipeline/labels.py`)
+
+For each (layer, feature_id) pair in the verdict, the backend hits
+
+```
+GET https://www.neuronpedia.org/api/feature/deepseek-r1-distill-llama-8b/{layer}-llamascope-slimpj-openr1-res-32k/{feature_id}
+```
+
+and reads `explanations[0].description`. Hits and explicit misses (empty string) are
+written to a `feature_labels` SQLite table keyed by `(layer, feature_id)` so subsequent
+runs touching the same features are fully offline. Concurrency is capped at 16 inflight
+requests (semaphore) with a 5s per-feature timeout. Verified: 100% of probed features
+across layers 0..31 have populated labels generated by GPT-4o-mini.
 
 ---
 

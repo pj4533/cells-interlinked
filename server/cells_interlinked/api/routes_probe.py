@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..pipeline.generation_loop import ProbeConfig, ProbeResult, run_probe
+from ..pipeline.labels import get_labels
 from ..pipeline.phase_tracker import Phase
 from ..pipeline.verdict import compute_verdict
 from ..storage import db
@@ -119,13 +120,35 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
         v = None
 
     if v is not None:
+        # Fetch human-readable labels for every (layer, feature) referenced in
+        # the verdict from Neuronpedia. Cached in SQLite, so subsequent runs
+        # touching the same features are instant. Empty string = no label.
+        keys = {
+            (x.layer, x.feature_id)
+            for col in (v.thinking, v.output, v.deltas, v.thinking_only, v.output_only)
+            for x in col
+        }
+        try:
+            labels = await get_labels(settings.db_path, list(keys))
+        except Exception as exc:
+            await state.queue.put({"type": "error", "message": f"label fetch failed: {exc}"})
+            labels = {}
+
+        def _attach(rows):
+            out = []
+            for r in rows:
+                d = asdict(r)
+                d["label"] = labels.get((r.layer, r.feature_id), "")
+                out.append(d)
+            return out
+
         await state.queue.put({
             "type": "verdict",
-            "thinking": [asdict(x) for x in v.thinking],
-            "output": [asdict(x) for x in v.output],
-            "deltas": [asdict(x) for x in v.deltas],
-            "thinking_only": [asdict(x) for x in v.thinking_only],
-            "output_only": [asdict(x) for x in v.output_only],
+            "thinking": _attach(v.thinking),
+            "output": _attach(v.output),
+            "deltas": _attach(v.deltas),
+            "thinking_only": _attach(v.thinking_only),
+            "output_only": _attach(v.output_only),
             "summary_stats": v.summary_stats,
         })
 
@@ -138,6 +161,7 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
         thinking_text="".join(thinking_chunks),
         output_text="".join(output_chunks),
         verdict=v,
+        labels=labels if v is not None else None,
     )
 
     await state.queue.put({"type": "done"})

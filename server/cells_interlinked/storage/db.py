@@ -70,8 +70,11 @@ async def update_probe_finish(
     thinking_text: str,
     output_text: str,
     verdict: Verdict | None,
+    labels: dict[tuple[int, int], str] | None = None,
 ) -> None:
-    verdict_json = json.dumps(_verdict_to_dict(verdict)) if verdict else None
+    verdict_json = (
+        json.dumps(_verdict_to_dict(verdict, labels or {})) if verdict else None
+    )
     async with aiosqlite.connect(path) as db:
         await db.execute(
             "UPDATE probes SET finished_at = ?, total_tokens = ?, stopped_reason = ?, "
@@ -81,13 +84,23 @@ async def update_probe_finish(
         await db.commit()
 
 
-def _verdict_to_dict(v: Verdict) -> dict[str, Any]:
+def _verdict_to_dict(
+    v: Verdict, labels: dict[tuple[int, int], str]
+) -> dict[str, Any]:
+    def attach(rows):
+        out = []
+        for r in rows:
+            d = asdict(r)
+            d["label"] = labels.get((r.layer, r.feature_id), "")
+            out.append(d)
+        return out
+
     return {
-        "thinking": [asdict(x) for x in v.thinking],
-        "output": [asdict(x) for x in v.output],
-        "deltas": [asdict(x) for x in v.deltas],
-        "thinking_only": [asdict(x) for x in v.thinking_only],
-        "output_only": [asdict(x) for x in v.output_only],
+        "thinking": attach(v.thinking),
+        "output": attach(v.output),
+        "deltas": attach(v.deltas),
+        "thinking_only": attach(v.thinking_only),
+        "output_only": attach(v.output_only),
         "summary_stats": v.summary_stats,
     }
 

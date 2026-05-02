@@ -165,6 +165,22 @@ async def run_probe(
     stopped_reason = "max"
     total_tokens = 0
 
+    # Per-phase running token-id buffer + last-decoded-string. Llama-3 BPE
+    # cannot be decoded one token at a time without leaking byte markers
+    # (Ġ for space, Ċ for newline). Decode the cumulative ID list each step
+    # and emit the new suffix.
+    #
+    # Additionally: the DeepSeek-R1-Distill-Llama-8B tokenizer ships with a
+    # broken ByteLevel decoder — `tokenizer.decode([...])` returns text with
+    # the visible byte-level characters (Ġ for 0x20 space, Ċ for 0x0A
+    # newline, ĉ for 0x09 tab) preserved as literal Unicode rather than
+    # converted back to their bytes. We post-process here.
+    phase_token_ids: dict[Phase, list[int]] = {Phase.THINKING: [], Phase.OUTPUT: []}
+    phase_decoded: dict[Phase, str] = {Phase.THINKING: "", Phase.OUTPUT: ""}
+
+    def _byte_fix(s: str) -> str:
+        return s.replace("Ġ", " ").replace("Ċ", "\n").replace("ĉ", "\t")
+
     await queue.put({
         "type": "phase_change",
         "from": None,
@@ -189,11 +205,27 @@ async def run_probe(
                 next_logits, temperature=cfg.temperature, top_p=cfg.top_p, generator=generator
             )
             token_id = int(tok.item())
-            decoded = bundle.tokenizer.decode([token_id], skip_special_tokens=False)
 
             phase_before = tracker.current
             phase_for_token = tracker.observe(token_id)
             phase_after = tracker.current
+
+            # Append to the phase's id buffer and decode the WHOLE buffer; the
+            # new visible chars are the suffix vs the previous decoded text.
+            # Then byte-fix the suffix to convert Ġ/Ċ back to space/newline.
+            if phase_for_token in (Phase.THINKING, Phase.OUTPUT):
+                ids_buf = phase_token_ids[phase_for_token]
+                ids_buf.append(token_id)
+                full_decoded = _byte_fix(
+                    bundle.tokenizer.decode(ids_buf, skip_special_tokens=False)
+                )
+                prev = phase_decoded[phase_for_token]
+                decoded = full_decoded[len(prev):]
+                phase_decoded[phase_for_token] = full_decoded
+            else:
+                decoded = _byte_fix(
+                    bundle.tokenizer.decode([token_id], skip_special_tokens=False)
+                )
 
             # Forward this single token to get residuals AT this token.
             with torch.no_grad():

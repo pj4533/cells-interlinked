@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..config import settings
+from ..pipeline.labels import init_labels_table
 from ..pipeline.model_loader import load_model
 from ..pipeline.sae_runner import SAEManager
 from ..storage import db
@@ -41,11 +42,13 @@ async def lifespan(app: FastAPI):
         repo_id=settings.sae_repo,
         layer_indices=settings.hook_layers,
         d_model=bundle.hidden_dim,
-        d_sae=65536,
+        # Llama-Scope-R1: expansion_factor=8, so d_sae = d_model * 8 = 32_768.
+        d_sae=bundle.hidden_dim * 8,
         device=bundle.device,
         dtype=dtype,
     )
     await asyncio.to_thread(saes.load)
+    await init_labels_table(settings.db_path)
 
     app.state.bundle = bundle
     app.state.saes = saes

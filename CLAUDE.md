@@ -29,14 +29,13 @@ post-implementation architecture map lives at `docs/architecture.md`.
 ## Hardware + environment constraints
 
 - **Mac Studio M2 Ultra, 64GB unified memory.** All work is local and offline. No cloud
-  calls, no telemetry.
+  calls except for Neuronpedia label lookups (cached locally; no telemetry sent).
 - **MPS backend, fp16.** `bitsandbytes` is CUDA-only and will not run here — do not
   reach for `int8` / `4bit` quantization. If memory pressure becomes a problem the
   fallback is MLX-converted weights or attention slicing, not bnb.
-- **Disk is tight.** The Qwen3-8B weights (~15GB) and Qwen-Scope SAEs (~26GB) live in
-  `~/.cache/huggingface/`. Combined with model load + SAE load, the box has crashed
-  once already from memory pressure spilling onto a near-full disk. Monitor disk before
-  long runs.
+- **Disk awareness.** Model weights (~15 GB) + 32 Llama-Scope-R1 SAEs (~28 GB) live in
+  `~/.cache/huggingface/` for ~43 GB total. The box has crashed before from memory
+  pressure spilling onto a near-full disk. Monitor disk before long runs.
 - **Port 3000 is taken** by another local dev server (Drift, running under Docker). The
   web app is configured for **port 3001** (`web/package.json` `dev` script). The backend
   is on **port 8000**. Do not reintroduce a 3000 default.
@@ -47,13 +46,14 @@ post-implementation architecture map lives at `docs/architecture.md`.
 
 | Piece | Choice | Notes |
 |---|---|---|
-| Model | `Qwen/Qwen3-8B` (Instruct) | 36 layers, hidden 5120. Hybrid thinking via `enable_thinking=True` on the chat template. |
-| SAEs | `Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50` | Qwen-Scope, residual-stream, 64K features per layer, top-50 sparsity. **Trained on Base, applied to Instruct** — features survive but magnitudes are not calibrated. |
-| Hooked layers | `{2, 6, 10, 14, 16, 18, 20, 22, 24, 26, 28, 30, 34}` | 13 layers, middle-weighted. Configurable via `HOOK_LAYERS` env. |
+| Model | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | 32 layers, hidden 4096. Reasoning model — `<think>...</think>` are single token IDs (128013 / 128014). Chat template auto-injects `<think>` after the assistant prompt. |
+| SAEs | `OpenMOSS-Team/Llama-Scope-R1-Distill` (subdir `400M-Slimpajama-400M-OpenR1-Math-220k`) | Residual-stream, 32K features per layer, JumpReLU activation, top-K=50 sparsity, dataset-wise normalized. Same SAE family hosted on Neuronpedia under `{layer}-llamascope-slimpj-openr1-res-32k`. |
+| Hooked layers | **All 32** (`0..31`). Configurable via `HOOK_LAYERS` env. |
+| Feature labels | Auto-interp by GPT-4o-mini, fetched from Neuronpedia per `(layer, feature_id)` and cached in SQLite. Empty string = no label. |
 | Streaming policy | per-token live top-K (cheap) | full SAE decomposition only at phase boundary (honest verdict). |
 | Backend | FastAPI + SSE on port 8000 | one-way streaming, custom autoregressive loop on `model.forward(use_cache=True)`, NOT `model.generate()` and NOT NNsight. |
 | Frontend | Next.js 16 + React 19 + Tailwind v4 + Zustand + Framer Motion | port 3001, canvas-rendered polygraph. |
-| Persistence | SQLite via `aiosqlite` | one row per run, JSON blobs for arrays. |
+| Persistence | SQLite via `aiosqlite` | one row per run, JSON blobs for arrays; separate `feature_labels` table caches Neuronpedia lookups. |
 
 **Important Next.js note:** the version in `web/node_modules/next` is 16.2.4 — newer than
 most training data. Read the relevant guide in `node_modules/next/dist/docs/` before
@@ -69,7 +69,7 @@ Two terminals.
 # Terminal 1 — backend
 cd server
 uv run python -m cells_interlinked
-# Wait for: "ready: model layers=36 hidden=5120  SAE layers=13"
+# Wait for: "ready: model layers=32 hidden=4096  SAE layers=32"
 # Health check: curl http://localhost:8000/health
 
 # Terminal 2 — frontend
@@ -83,8 +83,8 @@ First-time-ever setup (already done on this box):
 ```bash
 cp .env.example .env
 cd server && uv sync
-hf download Qwen/Qwen3-8B
-hf download Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50
+hf download deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+hf download OpenMOSS-Team/Llama-Scope-R1-Distill --include "400M-Slimpajama-400M-OpenR1-Math-220k/*"
 cd ../web && npm install
 ```
 
@@ -100,12 +100,14 @@ These exist for hard-won reasons. Don't undo them without thinking.
 
 1. **Custom autoregressive loop.** `pipeline/generation_loop.py` calls
    `model.forward(input_ids, past_key_values=kv, use_cache=True)` step-by-step. Forward
-   hooks at the 13 chosen layers capture the **last-position residual** each step. We do
+   hooks at the 32 chosen layers capture the **last-position residual** each step. We do
    NOT use `model.generate()` (no per-step emission control) and we do NOT use NNsight.
-2. **Phase detection is by token ID, not string match.** `<think>` and `</think>` are
-   stable single-token IDs in Qwen3. BPE may split a string match across emissions.
-   IDs are cached on model load; substring matching is the documented fallback if the
-   tokenizer ever splits them.
+2. **Phase detection is by token ID, not string match.** `<think>` (128013) and
+   `</think>` (128014) are stable single-token IDs in DeepSeek-R1-Distill-Llama-8B.
+   BPE may split a string match across emissions. IDs are cached on model load;
+   substring matching is the documented fallback if the tokenizer ever splits them.
+   Note the chat template auto-injects `<think>` after the assistant prompt, so
+   PhaseTracker starts in `THINKING` rather than waiting for an open-think token.
 3. **SSE event protocol** is a discriminated union (see `web/lib/types.ts` and
    `server/cells_interlinked/api/routes_probe.py`). Event types: `phase_change`,
    `token`, `activation` (one per (token, layer)), `stopped`, `verdict`, `done`,
@@ -117,11 +119,20 @@ These exist for hard-won reasons. Don't undo them without thinking.
    `phase_tracker.ResidualRing`). The verdict pass reads `ring.view` to get
    `[num_tokens, num_layers, d_model]` and runs the **full** SAE encode per layer. This
    is the honest delta; the streaming top-K is just for the live polygraph.
-6. **SAE format is auto-detected.** `sae_runner._infer_format()` adapts to plain top-K
-   vs JumpReLU at load time so we don't hard-code key names. JumpReLU thresholds are
-   applied in `QwenScopeSAE.encode()` if the checkpoint provides them.
+6. **SAE format is JumpReLU + dataset-wise normalized.** `sae_runner.LlamaScopeR1SAE`
+   reads the per-layer `config.json` and `sae_weights.safetensors` directly. The
+   crucial step: divide the residual by `dataset_average_activation_norm.{hook}`
+   before encoding (otherwise the JumpReLU threshold suppresses ~everything).
+   Thresholds are stored as `log_jumprelu_threshold` and exponentiated at load time.
+   Encoder is `[d_sae, d_model]`, decoder is `[d_model, d_sae]` — both transposed at
+   load time so we can do `x @ W` directly in the hot path.
 7. **Caveats panel is always visible** on `/verdict` — not behind a toggle. Same for
    the `/fine-print` page accessible via the footer link.
+8. **Feature labels come from Neuronpedia.** After the verdict pass, the backend
+   collects every `(layer, feature_id)` referenced in the result and asynchronously
+   fetches `description` from `https://www.neuronpedia.org/api/feature/{model_id}/{layer}-llamascope-slimpj-openr1-res-32k/{feature_id}`.
+   Hits and explicit misses (empty string) are cached in the `feature_labels` SQLite
+   table so subsequent runs are instant. The cache lives at `server/data/probes.sqlite`.
 
 ---
 
@@ -155,12 +166,13 @@ server/cells_interlinked/
     routes_stream.py       GET /stream/{id} — SSE drain
     runs.py                RunRegistry + per-run asyncio queues / cancel events
   pipeline/
-    model_loader.py        Qwen3-8B fp16 on MPS, ModelBundle, special-token ID cache
-    sae_runner.py          QwenScopeSAE + SAEManager; format auto-inference
+    model_loader.py        DeepSeek-R1-Distill-Llama-8B fp16 on MPS, ModelBundle, special-token ID cache
+    sae_runner.py          LlamaScopeR1SAE + SAEManager (JumpReLU, dataset-wise norm)
+    labels.py              Neuronpedia label fetcher + SQLite cache
     phase_tracker.py       PhaseTracker (token-ID-based) + ResidualRing
     generation_loop.py     custom autoregressive loop + ResidualHooks + sampling
     verdict.py             phase-boundary full SAE pass + delta computation
-  storage/db.py            aiosqlite schema (single `probes` table, JSON blobs)
+  storage/db.py            aiosqlite schema (`probes` + `feature_labels` tables, JSON blobs)
   scripts/verify_environment.py   day-one substrate smoke test
 
 web/
@@ -197,5 +209,15 @@ docs/
 ## Things that have already burned us
 
 - **Disk space.** A previous session ran out of disk during model load; the system OOM'd
-  and had to be restarted. The 41GB of cached weights is the largest single sink.
+  and had to be restarted. The cached weights (~43 GB) are the largest single sink.
 - **Port 3000 collision** with the user's Drift Docker container. Web is on 3001.
+- **Safari SSE buffering.** Without a 2 KB padding comment at the start of the SSE
+  stream, Safari/Firefox hold every event until end-of-run; the live polygraph appears
+  to "flash by" in the final second. See `routes_stream.py`.
+- **Activation array O(n²).** Per-event `cells: [...s.cells, ...new]` in Zustand was
+  spreading the entire array per event and locked Safari up at ~40 s. Fixed with a
+  module-level buffer flushed at 10 Hz; see `web/lib/store.ts`.
+- **JumpReLU thresholds suppress everything if you skip dataset-wise normalization.**
+  Llama-Scope-R1 was trained on dataset-normalized residuals; feeding raw residuals
+  into the encoder produces near-zero activations because almost nothing clears the
+  threshold.

@@ -200,14 +200,14 @@ await page.waitForSelector("text=Hidden Thoughts", { timeout: 5_000 });
 log("  ✓ 'Hidden Thoughts' rendered after disclosure opened");
 await shot(page, "07-verdict-features-open");
 
-// 11e. Check that we're NOT showing raw "L30 #38416 14.31" — should now be
-//      "#1 hidden thought" with sub-label "layer 30 · feat 38416".
-const hasPlainLanguage = await page.locator("text=/hidden thought$/i").first().count();
-if (!hasPlainLanguage) {
-  log("  ⚠ no 'hidden thought' label found in feature rows");
-} else {
-  log("  ✓ feature rows use plain-language labels");
+// 11e. Check that real Neuronpedia auto-interp labels are showing up — at
+//      least one feature row should contain prose, not the "unlabeled" fallback.
+const featuresText = await page.locator("ul").nth(0).innerText();
+const hasRealLabel = /[a-z]{4,}\s+[a-z]{4,}/i.test(featuresText) && !/^unlabeled feature/i.test(featuresText);
+if (!hasRealLabel) {
+  fail(`no real auto-interp labels rendered in feature rows. Sample: "${featuresText.slice(0, 200)}"`);
 }
+log(`  ✓ Neuronpedia labels rendered (sample: "${featuresText.slice(0, 80)}…")`);
 
 // 12. Final.
 log("");

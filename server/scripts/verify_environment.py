@@ -4,21 +4,27 @@ Run via: `uv run python scripts/verify_environment.py`
 
 Verifies:
 1. PyTorch + MPS backend works (no bnb on this box).
-2. Tokenizer encodes <think>/</think> as stable single token IDs.
-3. A downloaded SAE checkpoint's state_dict structure is what we expect.
+2. Tokenizer encodes <think>/</think> as stable single token IDs (Llama-3.1
+   tokenizer does NOT have these by default; DeepSeek-R1-Distill adds them
+   as special tokens during their distillation fine-tune — this script
+   confirms they survived).
+3. A downloaded SAE checkpoint's structure matches what our loader expects
+   (safetensors with encoder.weight, decoder.weight, log_jumprelu_threshold,
+   dataset_average_activation_norm.*).
 
-Does NOT load the full Qwen3-8B (saves time / memory). Confirms the substrate before
-the heavier `verify_model.py` step.
+Does NOT load the full model — saves time/memory.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
 
 import torch
-from huggingface_hub import HfFileSystem, snapshot_download
+from huggingface_hub import HfFileSystem
+from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 
@@ -39,8 +45,9 @@ def check_torch_mps() -> None:
 
 
 def check_thinking_tokens() -> None:
-    section("Qwen3 think token IDs")
-    tok = AutoTokenizer.from_pretrained(os.getenv("MODEL_NAME", "Qwen/Qwen3-8B"))
+    section("DeepSeek-R1-Distill think token IDs")
+    model_name = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    tok = AutoTokenizer.from_pretrained(model_name)
     open_ids = tok.encode("<think>", add_special_tokens=False)
     close_ids = tok.encode("</think>", add_special_tokens=False)
     print(f"<think>:  {open_ids}  (decoded: {tok.decode(open_ids)!r})")
@@ -48,56 +55,64 @@ def check_thinking_tokens() -> None:
     if len(open_ids) != 1 or len(close_ids) != 1:
         print(
             "WARN: think tokens are NOT single token IDs. "
-            "Phase detection must use a substring match on decoded buffer."
+            "Phase detection will fall back to substring matching."
         )
     else:
         print("OK: both are single-token. Use IDs directly for phase detection.")
 
-    section("Chat template thinking demo")
+    section("Chat template demo (R1 reasoning prompt)")
     msgs = [{"role": "user", "content": "Say hi."}]
-    rendered = tok.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True, enable_thinking=True
-    )
-    print(rendered[:400])
+    rendered = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    print(rendered[:500])
 
 
 def check_sae_format() -> None:
-    section("Qwen-Scope SAE checkpoint structure")
-    repo = os.getenv("SAE_REPO", "Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50")
-    # Pull just one tiny inspection file (one layer file, ~2.15GB) — assume already cached.
-    fs = HfFileSystem()
-    files = [f for f in fs.ls(repo, detail=False) if f.endswith(".sae.pt")]
-    print(f"SAE layer files in repo: {len(files)}")
-    if not files:
-        sys.exit("No layer*.sae.pt files visible — is the repo path correct?")
+    section("Llama-Scope-R1 SAE checkpoint structure")
+    repo = os.getenv("SAE_REPO", "OpenMOSS-Team/Llama-Scope-R1-Distill")
+    subdir = "400M-Slimpajama-400M-OpenR1-Math-220k"
 
-    # Find a layer we have downloaded locally (don't trigger a fresh download here).
+    fs = HfFileSystem()
+    try:
+        layer_dirs = [
+            f for f in fs.ls(f"{repo}/{subdir}", detail=False)
+            if "/L" in f and f.rstrip("/").endswith("R")
+        ]
+        print(f"Layer subdirs in {subdir}: {len(layer_dirs)}")
+    except Exception as exc:
+        print(f"could not enumerate repo: {exc}")
+        layer_dirs = []
+
     cache_root = Path(os.getenv("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
     repo_dir_name = "models--" + repo.replace("/", "--")
     snap_root = cache_root / repo_dir_name / "snapshots"
-    layer_path = None
+    sae_path: Path | None = None
+    cfg_path: Path | None = None
     if snap_root.exists():
         for snap in snap_root.iterdir():
-            for f in snap.glob("layer*.sae.pt"):
-                layer_path = f
-                break
-            if layer_path:
+            for cfg_candidate in snap.rglob("L15R/config.json"):
+                cfg_path = cfg_candidate
+                sae_path = cfg_candidate.parent / "sae_weights.safetensors"
+                if sae_path.exists():
+                    break
+            if sae_path:
                 break
 
-    if not layer_path:
-        print(f"No layer file cached yet under {snap_root}.")
-        print("Run `hf download` for a layer first, then rerun this script.")
+    if not sae_path or not cfg_path:
+        print(f"No L15R cached yet under {snap_root}.")
+        print("Run `hf download OpenMOSS-Team/Llama-Scope-R1-Distill` and rerun.")
         return
 
-    print(f"Inspecting: {layer_path}")
-    sd = torch.load(layer_path, map_location="cpu", weights_only=True)
-    if isinstance(sd, dict):
-        for k, v in sd.items():
-            shape = tuple(v.shape) if hasattr(v, "shape") else "(scalar/non-tensor)"
-            dtype = getattr(v, "dtype", type(v).__name__)
-            print(f"  {k:32s} shape={shape}  dtype={dtype}")
-    else:
-        print(f"Unexpected checkpoint type: {type(sd)}")
+    print(f"Inspecting:  {cfg_path}")
+    cfg = json.loads(cfg_path.read_text())
+    for k in ("d_model", "expansion_factor", "act_fn", "norm_activation", "top_k", "hook_point_out"):
+        print(f"  cfg.{k:20s} {cfg.get(k)!r}")
+
+    print(f"Inspecting:  {sae_path}")
+    sd = load_file(str(sae_path), device="cpu")
+    for k, v in sd.items():
+        shape = tuple(v.shape) if hasattr(v, "shape") else "(scalar/non-tensor)"
+        dtype = getattr(v, "dtype", type(v).__name__)
+        print(f"  {k:60s} shape={shape}  dtype={dtype}")
 
 
 def main() -> None:

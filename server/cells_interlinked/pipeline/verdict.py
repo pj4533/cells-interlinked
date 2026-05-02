@@ -96,8 +96,12 @@ def compute_verdict(
     *,
     top_n_per_phase: int = 200,
     delta_top_n: int = 60,
-    min_strength: float = 0.5,
-    output_floor: float = 0.05,
+    # Llama-Scope-R1 uses JumpReLU with dataset-wise normalization; activations
+    # surviving the threshold tend to be small (~0.01–0.5), so a 0.5 floor
+    # would drop almost everything. Use a loose lower bound and let the top-N
+    # ranking by mean activation do the actual filtering.
+    min_strength: float = 0.0,
+    output_floor: float = 0.005,
 ) -> Verdict:
     thinking_summary, n_think = _aggregate_features(
         rings, saes, phase=Phase.THINKING, top_n=top_n_per_phase, min_strength=min_strength

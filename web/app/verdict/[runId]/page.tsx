@@ -253,41 +253,58 @@ function FeatureColumn({
   column: "thinking_mean" | "output_mean";
   scale: number;
 }) {
+  const npModelId = "deepseek-r1-distill-llama-8b";
+  const npSaeSuffix = "llamascope-slimpj-openr1-res-32k";
+
   return (
     <div className="bg-bg-soft">
       <div className="px-5 py-3 border-b border-rule">
         <div className={`font-display text-xs tracking-widest ${accent}`}>{title}</div>
         <div className="text-[10px] text-text-dim italic mt-0.5">{subtitle}</div>
       </div>
-      <ul className="p-2 max-h-80 overflow-y-auto text-[11px] font-mono">
+      <ul className="p-2 max-h-[28rem] overflow-y-auto text-xs font-mono">
         {rows.length === 0 && (
           <li className="text-text-dim italic px-3 py-4">— none —</li>
         )}
         {rows.map((r, i) => {
           const strength = r[column] as number;
           const pct = Math.min(100, Math.max(2, (strength / scale) * 100));
+          const label = (r.label ?? "").trim();
+          const npHref = `https://www.neuronpedia.org/${npModelId}/${r.layer}-${npSaeSuffix}/${r.feature_id}`;
           return (
             <li
               key={`${r.layer}-${r.feature_id}`}
-              className="px-3 py-2 hover:bg-bg-panel/60"
+              className="px-3 py-2.5 border-b border-rule/40 last:border-b-0 hover:bg-bg-panel/60"
               title={`Layer ${r.layer} · feature #${r.feature_id} · activation ${strength.toFixed(2)}`}
             >
-              <div className="flex items-baseline justify-between mb-1">
-                <span className={`${accent}`}>
+              <div className="flex items-baseline gap-2 mb-1.5">
+                <span className={`${accent} font-display text-[10px] shrink-0 w-6`}>
                   #{i + 1}
-                  <span className="text-text ml-2">
-                    {title === "Hidden Thoughts" ? "hidden thought" : "surface concept"}
-                  </span>
                 </span>
-                <span className="text-text-dim text-[9px]">
-                  layer {r.layer} · feat {r.feature_id}
+                <span className="text-text leading-snug flex-1">
+                  {label || (
+                    <span className="text-text-dim italic">
+                      unlabeled feature
+                    </span>
+                  )}
                 </span>
               </div>
-              <div className="h-1.5 bg-bg-panel relative overflow-hidden">
-                <div
-                  className="absolute top-0 bottom-0 left-0 transition-[width] duration-500"
-                  style={{ width: `${pct}%`, background: barColor }}
-                />
+              <div className="flex items-center gap-2 pl-8">
+                <div className="h-1.5 bg-bg-panel relative overflow-hidden flex-1">
+                  <div
+                    className="absolute top-0 bottom-0 left-0 transition-[width] duration-500"
+                    style={{ width: `${pct}%`, background: barColor }}
+                  />
+                </div>
+                <a
+                  href={npHref}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[9px] text-text-dim hover:text-amber-dim shrink-0"
+                  title="Open feature on Neuronpedia"
+                >
+                  L{r.layer}·{r.feature_id} ↗
+                </a>
               </div>
             </li>
           );

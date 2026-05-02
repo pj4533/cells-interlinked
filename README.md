@@ -13,15 +13,21 @@ coherence test between stated stance and computed state.
 ## Stack
 
 - **Backend** (`server/`): Python 3.11, FastAPI + SSE, PyTorch on MPS, HuggingFace
-  Transformers, Qwen-Scope SAEs, aiosqlite. Runs on **port 8000**.
+  Transformers, Llama-Scope-R1 SAEs, aiosqlite. Runs on **port 8000**.
 - **Frontend** (`web/`): Next.js 16, React 19, Tailwind v4, Zustand, Framer Motion,
   canvas-rendered polygraph. Runs on **port 3001** (3000 is intentionally avoided so it
   doesn't collide with other local dev servers).
-- **Model**: `Qwen/Qwen3-8B` (Instruct, hybrid thinking via `enable_thinking=True`).
-- **SAEs**: `Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50` (Qwen-Scope, residual-stream, 64K
-  features per layer, top-50 sparsity). Trained on Base, applied to Instruct.
-- **Hooked layers**: 13 layers, middle-weighted —
-  `{2, 6, 10, 14, 16, 18, 20, 22, 24, 26, 28, 30, 34}`.
+- **Model**: `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` — a reasoning model distilled
+  from the full DeepSeek-R1 (671B). Uses `<think>...</think>` tags natively, identical
+  in shape to Qwen3.
+- **SAEs**: `OpenMOSS-Team/Llama-Scope-R1-Distill` (subdir
+  `400M-Slimpajama-400M-OpenR1-Math-220k`) — JumpReLU residual-stream SAEs, 32K
+  features per layer, top-K=50 sparsity, dataset-wise normalized.
+- **Hooked layers**: **all 32** (`0..31`). Configurable via `HOOK_LAYERS`.
+- **Labels**: every SAE feature has an auto-interp description (GPT-4o-mini-generated)
+  fetched on-demand from Neuronpedia and cached locally in SQLite. The verdict shows
+  real concept names like *"math equations and reasoning"* and *"instances of someone
+  speaking in a conversational way"* instead of bare feature numbers.
 
 ## First-time setup
 
@@ -31,8 +37,8 @@ cp .env.example .env
 # Backend (Python via uv)
 cd server
 uv sync
-hf download Qwen/Qwen3-8B
-hf download Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50
+hf download deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+hf download OpenMOSS-Team/Llama-Scope-R1-Distill --include "400M-Slimpajama-400M-OpenR1-Math-220k/*"
 cd ..
 
 # Frontend
@@ -41,7 +47,7 @@ npm install
 cd ..
 ```
 
-Combined model + SAE download is ~41 GB and lands in `~/.cache/huggingface/`.
+Combined model + SAE download is ~43 GB and lands in `~/.cache/huggingface/`.
 
 Optional substrate smoke test (verifies MPS works, `<think>` is a single-token ID, SAE
 checkpoint structure is what we expect — without loading the full 16 GB model):
@@ -57,7 +63,7 @@ Two terminals.
 ```bash
 # Terminal 1 — backend (port 8000)
 cd server && uv run python -m cells_interlinked
-# Wait for: "ready: model layers=36 hidden=5120  SAE layers=13"
+# Wait for: "ready: model layers=32 hidden=4096  SAE layers=32"
 # Sanity: curl http://localhost:8000/health
 
 # Terminal 2 — frontend (port 3001)
@@ -102,12 +108,13 @@ without further config.
 This is **not** a consciousness test. It is a coherence test between stated stance and
 computed state.
 
-- SAE feature labels are approximate. Auto-interp via Neuronpedia is deferred until
-  Qwen-Scope features land there.
+- SAE feature labels are GPT-4o-mini auto-interpretations from Neuronpedia. They are
+  hypotheses about what each feature represents, not ground truth.
 - Streaming top-K may miss features that hover just outside the cap; the verdict page
   uses the full SAE pass to recompute the delta honestly.
-- These SAEs were trained on `Qwen3-8B-Base` and applied to `Qwen3-8B` (Instruct).
-  Features survive the Base→Instruct shift; activation magnitudes are not calibrated.
+- These SAEs were trained on `Llama-3.1-8B-Base` activations and applied to the
+  DeepSeek-R1-Distill-Llama-8B variant. Features survive the distill; activation
+  magnitudes are not perfectly calibrated.
 - Single-prompt results are noisy. Cross-phrasing comparison is in scope for a later
   phase.
 

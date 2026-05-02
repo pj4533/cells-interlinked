@@ -21,23 +21,40 @@ class Settings:
     server_host: str = os.getenv("SERVER_HOST", "127.0.0.1")
     server_port: int = int(os.getenv("SERVER_PORT", "8000"))
 
-    model_name: str = os.getenv("MODEL_NAME", "Qwen/Qwen3-8B")
-    sae_repo: str = os.getenv("SAE_REPO", "Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_50")
+    model_name: str = os.getenv("MODEL_NAME", "deepseek-ai/DeepSeek-R1-Distill-Llama-8B")
+    sae_repo: str = os.getenv("SAE_REPO", "OpenMOSS-Team/Llama-Scope-R1-Distill")
 
     hook_layers: list[int] = field(
         default_factory=lambda: _int_list(
-            os.getenv("HOOK_LAYERS", "2,6,10,14,16,18,20,22,24,26,28,30,34")
+            os.getenv(
+                "HOOK_LAYERS",
+                "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,"
+                "16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31",
+            )
         )
     )
     stream_top_k: int = int(os.getenv("STREAM_TOP_K", "20"))
 
-    temperature: float = float(os.getenv("TEMPERATURE", "0.7"))
-    top_p: float = float(os.getenv("TOP_P", "0.8"))
+    temperature: float = float(os.getenv("TEMPERATURE", "0.6"))
+    top_p: float = float(os.getenv("TOP_P", "0.95"))
     seed: int = int(os.getenv("SEED", "42"))
 
     db_path: Path = Path(os.getenv("DB_PATH", "./data/probes.sqlite"))
     dtype: str = os.getenv("DTYPE", "float16")
     device: str = os.getenv("DEVICE", "mps")
+
+    # Neuronpedia label lookup
+    neuronpedia_api_base: str = os.getenv(
+        "NEURONPEDIA_API_BASE", "https://www.neuronpedia.org/api"
+    )
+    neuronpedia_model_id: str = os.getenv(
+        "NEURONPEDIA_MODEL_ID", "deepseek-r1-distill-llama-8b"
+    )
+    # Format: "{layer}-{NEURONPEDIA_SAE_SUFFIX}" — matches the slimpj-openr1
+    # SAE family on Neuronpedia, which has labels populated for every layer.
+    neuronpedia_sae_suffix: str = os.getenv(
+        "NEURONPEDIA_SAE_SUFFIX", "llamascope-slimpj-openr1-res-32k"
+    )
 
 
 settings = Settings()
