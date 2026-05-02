@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { motion } from "framer-motion";
 import Iris from "./Iris";
 
 // Status text rotates through these so the screen never sits still while we
@@ -39,10 +38,16 @@ export default function WarmingUpOverlay({ visible }: Props) {
       return;
     }
     const start = Date.now();
-    const tick = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 100) / 10), 100);
+    // Both timers are deliberately fast so the screen feels alive even
+    // through a 30s+ cold model warmup. The elapsed counter ticks every
+    // 100ms; the status line cycles every 1.4s.
+    const tick = setInterval(
+      () => setElapsed(Math.floor((Date.now() - start) / 100) / 10),
+      100,
+    );
     const rotate = setInterval(
       () => setIdx((i) => (i + 1) % STATUS_LINES.length),
-      1800,
+      1400,
     );
     return () => {
       clearInterval(tick);
@@ -52,68 +57,64 @@ export default function WarmingUpOverlay({ visible }: Props) {
 
   if (!visible) return null;
 
+  // Stages — purely visual progress hint based on wall-clock. Cold-start of
+  // Qwen3-8B fp16 on an M2 Ultra spends ~17s in the prompt forward pass; we
+  // map the elapsed time to a stage roughly so the user sees real progress.
+  const stage =
+    elapsed < 4
+      ? "tokenizing prompt"
+      : elapsed < 10
+      ? "encoding through 36 layers"
+      : elapsed < 18
+      ? "preparing first response token"
+      : "model is thinking — first token imminent";
+
   return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.6 }}
-      className="absolute inset-0 z-30 flex items-center justify-center bg-bg/90 backdrop-blur-sm"
-    >
-      {/* sweeping scan line across the overlay */}
-      <motion.div
-        aria-hidden
-        className="absolute left-0 right-0 h-[2px] pointer-events-none"
-        style={{
-          background:
-            "linear-gradient(90deg, transparent, rgba(232,195,130,0.6), transparent)",
-          boxShadow: "0 0 12px rgba(232,195,130,0.5)",
-        }}
-        initial={{ top: "0%" }}
-        animate={{ top: ["0%", "100%", "0%"] }}
-        transition={{ duration: 3.2, repeat: Infinity, ease: "linear" }}
-      />
+    <div className="absolute inset-0 z-30 flex items-center justify-center bg-bg/85 backdrop-blur-sm overlay-fade-in">
+      {/* sweeping scan line — pure CSS keyframes, framer-free */}
+      <div aria-hidden className="overlay-scanline" />
 
-      <div className="flex flex-col items-center gap-6">
-        <Iris size={180} dilation={0.3 + (elapsed % 2) * 0.15} />
+      {/* corner crosshair brackets — frame the iris dramatically */}
+      <div aria-hidden className="overlay-bracket overlay-bracket-tl" />
+      <div aria-hidden className="overlay-bracket overlay-bracket-tr" />
+      <div aria-hidden className="overlay-bracket overlay-bracket-bl" />
+      <div aria-hidden className="overlay-bracket overlay-bracket-br" />
 
-        <div className="text-center">
-          <div className="font-display text-[10px] text-amber-dim tracking-widest mb-1">
-            warming up
-          </div>
-          <motion.div
-            key={idx}
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.4 }}
-            className="font-display text-sm text-amber amber-glow tracking-widest"
-          >
-            {STATUS_LINES[idx]}
-            <span className="animate-pulse text-amber-dim">…</span>
-          </motion.div>
+      <div className="flex flex-col items-center gap-6 max-w-md px-6">
+        {/* Iris with a faster-spinning halo ring around it for visible motion. */}
+        <div className="relative">
+          <Iris size={180} dilation={0.3 + (elapsed % 2) * 0.15} />
+          <div aria-hidden className="absolute inset-[-12px] overlay-halo" />
         </div>
 
-        <div className="flex items-center gap-3">
-          {/* tick marks */}
-          {Array.from({ length: 5 }).map((_, i) => (
-            <motion.div
-              key={i}
-              className="w-1.5 h-1.5 rounded-full bg-amber-dim"
-              animate={{ opacity: [0.2, 1, 0.2] }}
-              transition={{
-                duration: 1.4,
-                repeat: Infinity,
-                delay: i * 0.18,
-                ease: "easeInOut",
-              }}
-            />
-          ))}
+        <div className="text-center">
+          <div className="font-display text-[10px] text-amber-dim tracking-widest mb-2">
+            voight-kampff scope active
+          </div>
+          <div
+            key={idx}
+            className="font-display text-base text-amber amber-glow tracking-widest overlay-status-fade"
+          >
+            {STATUS_LINES[idx]}
+            <span className="text-amber-dim">…</span>
+          </div>
+        </div>
+
+        {/* Stage line — changes through deterministic phases so the user
+            sees genuine forward motion instead of just rotating eye candy. */}
+        <div className="text-[11px] text-cyan/80 font-mono tracking-wider text-center">
+          ▸ {stage}
+        </div>
+
+        {/* Indeterminate progress bar — gives a clear "working" affordance. */}
+        <div className="w-64 h-px bg-rule overflow-hidden relative">
+          <div className="overlay-progress-bar" />
         </div>
 
         <div className="text-[10px] text-text-dim font-mono tracking-wider">
           t+{elapsed.toFixed(1)}s
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }

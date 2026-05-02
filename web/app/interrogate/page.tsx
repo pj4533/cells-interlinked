@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { motion } from "framer-motion";
 import ProbePicker from "../components/ProbePicker";
 import TokenStream from "../components/TokenPanes";
@@ -12,7 +12,6 @@ import { startProbe, subscribe, cancelProbe } from "@/lib/sse";
 import { useRun } from "@/lib/store";
 
 export default function InterrogatePage() {
-  const router = useRouter();
   const run = useRun();
   const [error, setError] = useState<string | null>(null);
 
@@ -37,15 +36,6 @@ export default function InterrogatePage() {
     return () => run.reset();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Auto-navigate to verdict once the run is done and we have a verdict
-  useEffect(() => {
-    if (run.runId && !run.isRunning && run.verdict) {
-      const id = run.runId;
-      const t = setTimeout(() => router.push(`/verdict/${id}`), 1200);
-      return () => clearTimeout(t);
-    }
-  }, [run.runId, run.isRunning, run.verdict, router]);
 
   // Compute the unicorn-feature set from the streaming top-K.
   const unicornFeatures = useMemo(() => {
@@ -172,6 +162,27 @@ export default function InterrogatePage() {
             >
               Halt
             </button>
+          )}
+
+          {/* When the run completes, surface a CTA to view the verdict.
+              Deliberately NOT auto-navigating — the user wanted time to see
+              the polygraph + transcripts before being whisked away. */}
+          {!run.isRunning && run.runId && run.verdict && (
+            <motion.div
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.6 }}
+              className="flex flex-col gap-2"
+            >
+              <div className="font-display text-[10px] text-amber tracking-widest amber-glow text-center">
+                run complete
+              </div>
+              <Link href={`/verdict/${run.runId}`}>
+                <button data-vk type="button" className="w-full">
+                  View Verdict →
+                </button>
+              </Link>
+            </motion.div>
           )}
         </div>
       </div>

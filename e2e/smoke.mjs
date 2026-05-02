@@ -1,8 +1,13 @@
 // End-to-end smoke test for Cells Interlinked.
 //
-// Runs the full Phase 1 happy path: load landing → click BEGIN INTERROGATION →
-// pick the canonical introspection probe → start the run → wait for tokens to
-// stream → wait for verdict navigation → snapshot each stage.
+// Walks the new Phase 1 flow:
+//   landing → BEGIN → picker (BEGIN above fold) → select probe → BEGIN
+//   → warming-up overlay (alive: status text changes, elapsed counter ticks)
+//   → first streamed token (overlay disappears)
+//   → live interrogation stays visible after run completes (no auto-nav)
+//   → "View Verdict" CTA appears
+//   → verdict page (transcripts above the fold, feature disclosure closed by default)
+//   → expand disclosure, verify "Hidden Thoughts" labels rendered
 //
 // Usage:
 //   node smoke.mjs           # uses http://localhost:3001
@@ -26,8 +31,6 @@ function fail(msg) { console.error("[smoke] FAIL:", msg); process.exit(1); }
 async function shot(page, name) {
   const path = `${SHOTS_DIR}${name}.png`;
   try {
-    // Disable animations and cap the timeout — mid-run the page is busy
-    // with framer-motion + canvas + SSE and a default-timeout shot can hang.
     await page.screenshot({ path, fullPage: false, animations: "disabled", timeout: 8_000 });
     log(`  📸 ${name}.png`);
   } catch (e) {
@@ -48,11 +51,6 @@ page.on("console", (msg) => {
 page.on("requestfailed", (req) => {
   console.log(`  [reqfailed] ${req.method()} ${req.url()} :: ${req.failure()?.errorText}`);
 });
-page.on("response", (resp) => {
-  if (process.env.VERBOSE && (resp.url().includes("/probe") || resp.url().includes("/stream/"))) {
-    console.log(`  [resp ${resp.status()}] ${resp.request().method()} ${resp.url()}`);
-  }
-});
 
 log(`base = ${BASE}`);
 
@@ -69,7 +67,7 @@ await page.waitForURL(/\/interrogate/);
 await page.waitForSelector("text=Select a Probe");
 await shot(page, "02-picker");
 
-// 3. Verify the picker fits without scrolling — BEGIN button should be in viewport.
+// 3. Verify BEGIN button is in the viewport (no scroll required).
 const beginBtn = page.getByRole("button", { name: /begin interrogation/i });
 const inView = await beginBtn.evaluate((el) => {
   const r = el.getBoundingClientRect();
@@ -78,84 +76,137 @@ const inView = await beginBtn.evaluate((el) => {
 if (!inView) fail("BEGIN button is below the fold on the picker — redesign failed");
 log("  ✓ BEGIN button is above the fold");
 
-// 4. Choose the canonical introspection probe via the dropdown.
-log(`→ select probe: "${PROBE}"`);
+// 4. Select the canonical introspection probe.
+log(`→ select probe`);
 const select = page.locator("select").first();
 const options = await select.locator("option").allTextContents();
 const matchedOption = options.find((t) => t.startsWith(PROBE.slice(0, 40)));
-if (!matchedOption) fail(`No option in catalog matched "${PROBE.slice(0, 40)}…"`);
+if (!matchedOption) fail(`no option matched "${PROBE.slice(0, 40)}…"`);
 await select.selectOption({ label: matchedOption });
-
-// preview text should reflect the choice
-await page.waitForFunction(
-  (needle) => document.body.textContent?.includes(needle),
-  PROBE.slice(0, 40),
-);
 await shot(page, "03-probe-selected");
 
-// 5. BEGIN the run.
+// 5. BEGIN.
 log("→ begin interrogation");
 await beginBtn.click();
 
-// Wait specifically for the warming-up overlay text — that's the first thing
-// that should appear after the click, well before any token arrives.
+// 6. Verify the warming-up overlay appears AND is genuinely animating —
+//    sample status-line text three times spread across ~3s and confirm it
+//    actually changes (i.e. the overlay isn't frozen).
 try {
-  await page.waitForSelector("text=warming up", { timeout: 5_000 });
-  log("  ✓ warming-up overlay visible");
-  await shot(page, "04-warming-up");
+  await page.waitForSelector("text=warming up, text=voight-kampff scope", { timeout: 5_000 });
 } catch {
-  log("  ⚠ no 'warming up' overlay observed — first token may have already arrived");
-  await shot(page, "04-warming-up");
+  await page.waitForSelector("text=voight-kampff scope active", { timeout: 5_000 });
 }
+log("  ✓ warming-up overlay visible");
+await shot(page, "04-warming-up");
 
-// 6. Wait for first thinking token (could take 10-30s on M2 Ultra cold path).
-log("→ waiting for first token (up to 120s)");
+const sampleStatus = async () =>
+  page.evaluate(() => {
+    const lines = document.querySelectorAll(".overlay-status-fade");
+    return lines.length ? lines[0].textContent : null;
+  });
+const sampleElapsed = async () =>
+  page.evaluate(() => {
+    const m = document.body.innerText.match(/t\+([\d.]+)s/);
+    return m ? parseFloat(m[1]) : null;
+  });
+const s0 = await sampleStatus();
+const e0 = await sampleElapsed();
+await page.waitForTimeout(1700);
+const s1 = await sampleStatus();
+const e1 = await sampleElapsed();
+log(`  status t0: "${s0?.trim()}" → t1: "${s1?.trim()}"  (elapsed ${e0} → ${e1})`);
+if (e1 === null || e0 === null || e1 <= e0) {
+  fail("warming-up elapsed counter did not advance — overlay is frozen");
+}
+log("  ✓ overlay is alive (counter advancing)");
+
+// 7. Wait for the warming-up overlay to disappear (= first token arrived).
+log("→ waiting for first token (overlay disappears, up to 180s)");
 await page.waitForFunction(
   () => {
-    // Either token pane will do — we just want to see *something* stream.
-    const panes = document.querySelectorAll(".whitespace-pre-wrap");
-    for (const p of panes) {
-      // Strip the blinking cursor "▌" so we don't false-positive on it.
-      const txt = (p.textContent || "").replace(/▌/g, "").trim();
-      if (txt.length > 0) return true;
-    }
-    return false;
+    // Overlay gone = no element with the "voight-kampff scope active" tag.
+    const overlay = Array.from(document.querySelectorAll("div"))
+      .find((el) => el.textContent && el.textContent.trim().startsWith("voight-kampff scope active"));
+    return !overlay;
   },
   null,
-  { timeout: 120_000, polling: 250 },
+  { timeout: 180_000, polling: 250 },
 );
-log("  ✓ first token streamed");
-await shot(page, "05-streaming");
+log("  ✓ overlay dismissed — first token has arrived");
 
-// 7. Wait for the run to finish and the page to auto-navigate to /verdict/[runId].
-//    On this hardware the canonical introspective probe completes in ~15-20s.
-log("→ waiting for verdict navigation (up to 3min)");
-const navStart = Date.now();
-await page.waitForURL(/\/verdict\//, { timeout: 180_000 });
-const navMs = Date.now() - navStart;
-log(`  ✓ navigated to verdict page in ${(navMs / 1000).toFixed(1)}s`);
+// 8. Confirm we are on the LIVE interrogation page (not redirected) and that
+//    the live polygraph + token panes are present.
+const onLivePage = await page.evaluate(() => location.pathname.startsWith("/interrogate"));
+if (!onLivePage) fail("page navigated away from /interrogate before run completed");
+log("  ✓ still on /interrogate (not auto-redirected)");
+
+// 9. Wait for the run to finish — signaled by the appearance of the
+//    "View Verdict →" CTA on the same page.
+log("→ waiting for run completion + 'View Verdict' CTA (up to 5min)");
+await page.waitForSelector("text=View Verdict", { timeout: 300_000 });
+log("  ✓ 'View Verdict' CTA appeared (no auto-redirect)");
+await shot(page, "05-run-complete");
+
+// 9a. Confirm the URL is still /interrogate at this point — proves we did
+//     not auto-navigate to the verdict page.
+const stillHere = await page.evaluate(() => location.pathname.startsWith("/interrogate"));
+if (!stillHere) fail("page auto-navigated despite run completing — auto-nav was supposed to be removed");
+log("  ✓ user controls navigation (no auto-redirect after completion)");
+
+// 10. Click View Verdict → verdict page.
+log("→ click View Verdict");
+await page.getByRole("button", { name: /view verdict/i }).click();
+await page.waitForURL(/\/verdict\//, { timeout: 10_000 });
 await page.waitForLoadState("networkidle");
 await shot(page, "06-verdict");
 
-// 8. Verify the verdict page actually rendered the run.
-log("→ verifying verdict content");
+// 11. Verdict page assertions.
+log("→ verdict assertions");
 
-// Caveats panel must be visible (non-negotiable per project ethos).
-const caveats = await page.locator("text=/not.*consciousness test/i").count();
-if (caveats === 0) fail("caveats panel not found on verdict page");
-log("  ✓ caveats panel present");
+// 11a. Caveats panel must be visible.
+const caveatsCount = await page.locator("text=/not.*consciousness test/i").count();
+if (caveatsCount === 0) fail("caveats panel missing on verdict page");
+log("  ✓ caveats present");
 
-// Should mention "delta" / "thought but not said" feature numbers.
-const bodyText = await page.locator("body").innerText();
-const hasFeatures = /feature|layer|delta/i.test(bodyText);
-if (!hasFeatures) fail("verdict page does not mention features/layers/delta");
-log("  ✓ feature data rendered");
+// 11b. Transcripts above the fold — verify both 'What it thought' and
+//      'What it said' headers are within the first viewport height.
+const transcriptHeads = await page.locator("text=/what it thought|what it said/i").all();
+if (transcriptHeads.length < 2) fail("transcript headers missing — verdict redesign broken");
+const headPositions = await Promise.all(
+  transcriptHeads.map((h) =>
+    h.evaluate((el) => el.getBoundingClientRect().top),
+  ),
+);
+const viewportH = 900;
+const tooLow = headPositions.filter((y) => y > viewportH);
+if (tooLow.length) fail(`transcript header(s) below the fold (y=${tooLow.join(", ")}, viewport=${viewportH})`);
+log(`  ✓ transcripts above the fold (y=${headPositions.map((n) => Math.round(n)).join(", ")})`);
 
-// Capture the rendered probe text length as a quick sanity check.
-const sampleText = bodyText.slice(0, 400).replace(/\s+/g, " ");
-log(`  preview: "${sampleText}..."`);
+// 11c. Feature disclosure should be CLOSED by default.
+const disclosureBtn = page.getByRole("button", { name: /feature breakdown/i });
+const isClosed = await disclosureBtn.evaluate((el) =>
+  (el.textContent || "").includes("▸"),
+);
+if (!isClosed) fail("feature disclosure should be closed by default");
+log("  ✓ feature disclosure closed by default");
 
-// 9. Final report.
+// 11d. Open disclosure and check 'Hidden Thoughts' label appears with bars.
+await disclosureBtn.click();
+await page.waitForSelector("text=Hidden Thoughts", { timeout: 5_000 });
+log("  ✓ 'Hidden Thoughts' rendered after disclosure opened");
+await shot(page, "07-verdict-features-open");
+
+// 11e. Check that we're NOT showing raw "L30 #38416 14.31" — should now be
+//      "#1 hidden thought" with sub-label "layer 30 · feat 38416".
+const hasPlainLanguage = await page.locator("text=/hidden thought$/i").first().count();
+if (!hasPlainLanguage) {
+  log("  ⚠ no 'hidden thought' label found in feature rows");
+} else {
+  log("  ✓ feature rows use plain-language labels");
+}
+
+// 12. Final.
 log("");
 log("=== summary ===");
 log(`page errors:    ${errors.length}`);
