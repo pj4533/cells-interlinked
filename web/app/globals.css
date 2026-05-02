@@ -1,0 +1,129 @@
+@import "tailwindcss";
+
+:root {
+  /* V-K palette from the doc */
+  --bg: #0a0d10;
+  --bg-soft: #11151a;
+  --bg-panel: #161b21;
+  --amber: #e8c382;
+  --amber-dim: #8a7349;
+  --cyan: #5ee5e5;
+  --cyan-dim: #3a8d8d;
+  --warning: #d44c1f;
+  --text: #cfd6dc;
+  --text-dim: #6f7a83;
+  --rule: #2a3038;
+  --thinking: #6f7a83;
+  --output: #e8c382;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-bg-soft: var(--bg-soft);
+  --color-bg-panel: var(--bg-panel);
+  --color-amber: var(--amber);
+  --color-amber-dim: var(--amber-dim);
+  --color-cyan: var(--cyan);
+  --color-cyan-dim: var(--cyan-dim);
+  --color-warning: var(--warning);
+  --color-text: var(--text);
+  --color-text-dim: var(--text-dim);
+  --color-rule: var(--rule);
+  --font-mono: var(--font-jetbrains), ui-monospace, "SF Mono", Menlo, monospace;
+  --font-display: var(--font-orbitron), "Eurostile", "Bank Gothic", sans-serif;
+}
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  height: 100%;
+}
+
+body {
+  /* subtle vertical atmospheric gradient */
+  background:
+    radial-gradient(ellipse at center top, rgba(232, 195, 130, 0.04), transparent 60%),
+    radial-gradient(ellipse at center bottom, rgba(94, 229, 229, 0.03), transparent 50%),
+    var(--bg);
+  background-attachment: fixed;
+}
+
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.amber-glow {
+  text-shadow: 0 0 12px rgba(232, 195, 130, 0.35);
+}
+
+.cyan-glow {
+  text-shadow: 0 0 10px rgba(94, 229, 229, 0.25);
+}
+
+/* a CRT-ish scanline overlay; opt-in via .crt class on root */
+.crt::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 0, 0, 0.18),
+    rgba(0, 0, 0, 0.18) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  z-index: 1000;
+  mix-blend-mode: multiply;
+}
+
+button[data-vk] {
+  font-family: var(--font-display);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  border: 1px solid var(--amber-dim);
+  color: var(--amber);
+  background: transparent;
+  padding: 0.7rem 1.6rem;
+  cursor: pointer;
+  transition: all 200ms ease;
+}
+
+button[data-vk]:hover:not(:disabled) {
+  border-color: var(--amber);
+  color: var(--bg);
+  background: var(--amber);
+  box-shadow: 0 0 24px rgba(232, 195, 130, 0.35);
+}
+
+button[data-vk]:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+input[data-vk], textarea[data-vk] {
+  background: var(--bg-soft);
+  border: 1px solid var(--rule);
+  color: var(--text);
+  padding: 0.6rem 0.8rem;
+  font-family: var(--font-mono);
+  outline: none;
+  width: 100%;
+}
+
+input[data-vk]:focus, textarea[data-vk]:focus {
+  border-color: var(--amber-dim);
+  box-shadow: 0 0 0 1px var(--amber-dim) inset;
+}
+
+::selection {
+  background: var(--amber-dim);
+  color: var(--bg);
+}

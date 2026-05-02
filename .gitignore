@@ -1,0 +1,65 @@
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# uv
+.uv/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+.pnp/
+.pnp.js
+.yarn/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Local data (per-user runtime state — DBs, downloaded weights, run logs)
+data/
+server/data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Model weights and SAE caches (large, downloaded separately)
+models/
+saes/
+*.safetensors
+*.bin
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+logs/
