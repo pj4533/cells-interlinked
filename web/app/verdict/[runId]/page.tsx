@@ -106,6 +106,8 @@ export default function VerdictPage() {
       {/* Feature breakdown — collapsible disclosure, default closed */}
       {v && (
         <FeatureDisclosure
+          thinking={v.thinking}
+          output={v.output}
           thinkingOnly={v.thinking_only}
           outputOnly={v.output_only}
         />
@@ -168,22 +170,71 @@ function Transcript({
 
 /* ---------------- Feature breakdown (collapsible) ---------------- */
 
+/** Shape every row gets normalized to before rendering. */
+interface NormalizedRow {
+  layer: number;
+  feature_id: number;
+  label: string;
+  label_model?: string;
+  /** The numeric value to display as a bar — what each panel ranks by. */
+  value: number;
+}
+
 function FeatureDisclosure({
+  thinking,
+  output,
   thinkingOnly,
   outputOnly,
 }: {
+  thinking: FeatureSummary[];
+  output: FeatureSummary[];
   thinkingOnly: DeltaEntry[];
   outputOnly: DeltaEntry[];
 }) {
   const [open, setOpen] = useState(false);
 
-  // Normalize strengths to 0..1 for the bar visualizations, computed once.
-  const thinkingMax = useMemo(
-    () => Math.max(0.001, ...thinkingOnly.map((d) => d.thinking_mean)),
+  // Normalize each panel's rows + compute a per-panel bar scale so the
+  // strongest row in each panel always reads as a full bar. Each panel has
+  // its own scale because the value ranges are very different across
+  // panels (delta vs raw mean activation).
+  const topThinking: NormalizedRow[] = useMemo(
+    () => thinking.map((s) => ({
+      layer: s.layer,
+      feature_id: s.feature_id,
+      label: (s.label ?? "").trim(),
+      label_model: s.label_model,
+      value: s.mean,
+    })),
+    [thinking],
+  );
+  const topOutput: NormalizedRow[] = useMemo(
+    () => output.map((s) => ({
+      layer: s.layer,
+      feature_id: s.feature_id,
+      label: (s.label ?? "").trim(),
+      label_model: s.label_model,
+      value: s.mean,
+    })),
+    [output],
+  );
+  const hidden: NormalizedRow[] = useMemo(
+    () => thinkingOnly.map((d) => ({
+      layer: d.layer,
+      feature_id: d.feature_id,
+      label: (d.label ?? "").trim(),
+      label_model: d.label_model,
+      value: d.thinking_mean,
+    })),
     [thinkingOnly],
   );
-  const outputMax = useMemo(
-    () => Math.max(0.001, ...outputOnly.map((d) => d.output_mean)),
+  const surface: NormalizedRow[] = useMemo(
+    () => outputOnly.map((d) => ({
+      layer: d.layer,
+      feature_id: d.feature_id,
+      label: (d.label ?? "").trim(),
+      label_model: d.label_model,
+      value: d.output_mean,
+    })),
     [outputOnly],
   );
 
@@ -199,99 +250,144 @@ function FeatureDisclosure({
             feature breakdown {open ? "▾" : "▸"}
           </div>
           <div className="text-[10px] text-text-dim italic mt-0.5">
-            For the curious: a peek inside the model's residual stream. Each row is a
-            feature in a sparse autoencoder — think of it as one isolated &ldquo;concept
-            channel&rdquo; the model can light up.
+            Inside the model&rsquo;s residual stream. Each row is one feature
+            in a sparse autoencoder — an isolated &ldquo;concept channel&rdquo;
+            the model can light up.
           </div>
         </div>
         <div className="flex flex-col items-end text-[10px] text-text-dim font-mono">
-          <span>{thinkingOnly.length} hidden thoughts</span>
-          <span>{outputOnly.length} surface-only</span>
+          <span>{topThinking.length} thinking · {topOutput.length} output</span>
+          <span>{hidden.length} hidden · {surface.length} surface-only</span>
         </div>
       </button>
 
       {open && (
-        <div className="border-t border-rule grid grid-cols-1 md:grid-cols-2 gap-px bg-rule">
-          <FeatureColumn
-            title="Hidden Thoughts"
-            subtitle="Concepts the model lit up while thinking, then suppressed before answering."
-            accent="text-amber"
-            barColor="rgba(232,195,130,0.6)"
-            rows={thinkingOnly}
-            column="thinking_mean"
-            scale={thinkingMax}
+        <div className="border-t border-rule">
+          {/* Row 1 — RAW activation. The features the model worked with most
+              in each phase, regardless of overlap. */}
+          <SectionHeader
+            label="01 · raw activation"
+            note="Top features ranked by mean activation within the phase. Includes features that fired in both phases."
           />
-          <FeatureColumn
-            title="Surface-Only Concepts"
-            subtitle="Concepts that appeared in the answer but never lit up while thinking."
-            accent="text-cyan"
-            barColor="rgba(94,229,229,0.55)"
-            rows={outputOnly}
-            column="output_mean"
-            scale={outputMax}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-px bg-rule border-y border-rule">
+            <FeaturePanel
+              title="Top in Thinking"
+              subtitle="What the model lit up most while reasoning."
+              accent="text-amber"
+              barColor="rgba(232,195,130,0.6)"
+              rows={topThinking}
+            />
+            <FeaturePanel
+              title="Top in Output"
+              subtitle="What the model lit up most while answering."
+              accent="text-cyan"
+              barColor="rgba(94,229,229,0.55)"
+              rows={topOutput}
+            />
+          </div>
+
+          {/* Row 2 — DELTA. The phase-exclusive concepts. This is the
+              V-K signal: thought-but-not-said + said-but-not-thought. */}
+          <SectionHeader
+            label="02 · phase-exclusive (the v-k delta)"
+            note="Features dominant in only one phase. Hidden Thoughts are concepts the model considered but didn’t verbalize; Surface-Only are concepts that appeared in the answer without showing up in the reasoning trace."
           />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-px bg-rule">
+            <FeaturePanel
+              title="Hidden Thoughts"
+              subtitle="Lit up while thinking, then suppressed before answering."
+              accent="text-amber"
+              barColor="rgba(232,195,130,0.6)"
+              rows={hidden}
+            />
+            <FeaturePanel
+              title="Surface-Only Concepts"
+              subtitle="Appeared in the answer but never lit up while thinking."
+              accent="text-cyan"
+              barColor="rgba(94,229,229,0.55)"
+              rows={surface}
+            />
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function FeatureColumn({
+/** Banner above each row of two panels — gives a visible label so the
+ *  user knows what view they're looking at. */
+function SectionHeader({ label, note }: { label: string; note: string }) {
+  return (
+    <div className="bg-bg-panel/40 px-5 py-2 border-b border-rule">
+      <div className="font-display text-[10px] text-amber tracking-[0.25em] uppercase">
+        {label}
+      </div>
+      <div className="text-[10px] text-text-dim italic mt-0.5 leading-snug">
+        {note}
+      </div>
+    </div>
+  );
+}
+
+function FeaturePanel({
   title,
   subtitle,
   accent,
   barColor,
   rows,
-  column,
-  scale,
 }: {
   title: string;
   subtitle: string;
   accent: string;
   barColor: string;
-  rows: DeltaEntry[];
-  column: "thinking_mean" | "output_mean";
-  scale: number;
+  rows: NormalizedRow[];
 }) {
   const npModelId = "deepseek-r1-distill-llama-8b";
   const npSaeSuffix = "llamascope-slimpj-openr1-res-32k";
+  const scale = useMemo(
+    () => Math.max(0.001, ...rows.map((r) => r.value)),
+    [rows],
+  );
 
   return (
-    <div className="bg-bg-soft">
-      <div className="px-5 py-3 border-b border-rule">
-        <div className={`font-display text-xs tracking-widest ${accent}`}>{title}</div>
+    <div className="bg-bg-soft flex flex-col">
+      <div className="px-5 py-3 border-b border-rule shrink-0">
+        <div className="flex items-baseline justify-between gap-3">
+          <div className={`font-display text-xs tracking-widest ${accent}`}>
+            {title}
+          </div>
+          <div className="font-mono text-[9px] text-text-dim shrink-0">
+            {rows.length} {rows.length === 1 ? "feature" : "features"}
+          </div>
+        </div>
         <div className="text-[10px] text-text-dim italic mt-0.5">{subtitle}</div>
       </div>
-      <ul className="p-2 max-h-[28rem] overflow-y-auto text-xs font-mono">
+      <ul className="p-1.5 max-h-[24rem] overflow-y-auto text-xs font-mono">
         {rows.length === 0 && (
-          <li className="text-text-dim italic px-3 py-4">— none —</li>
+          <li className="text-text-dim italic px-3 py-6 text-center">— none —</li>
         )}
         {rows.map((r, i) => {
-          const strength = r[column] as number;
-          const pct = Math.min(100, Math.max(2, (strength / scale) * 100));
-          const label = (r.label ?? "").trim();
+          const pct = Math.min(100, Math.max(2, (r.value / scale) * 100));
           const npHref = `https://www.neuronpedia.org/${npModelId}/${r.layer}-${npSaeSuffix}/${r.feature_id}`;
           return (
             <li
               key={`${r.layer}-${r.feature_id}`}
-              className="px-3 py-2.5 border-b border-rule/40 last:border-b-0 hover:bg-bg-panel/60"
-              title={`Layer ${r.layer} · feature #${r.feature_id} · activation ${strength.toFixed(2)}`}
+              className="px-3 py-2 border-b border-rule/30 last:border-b-0 hover:bg-bg-panel/60 transition-colors"
+              title={`Layer ${r.layer} · feature #${r.feature_id} · activation ${r.value.toFixed(3)}`}
             >
               <div className="flex items-baseline gap-2 mb-1.5">
                 <span className={`${accent} font-display text-[10px] shrink-0 w-6`}>
-                  #{i + 1}
+                  {String(i + 1).padStart(2, "0")}
                 </span>
                 <span className="text-text leading-snug flex-1">
-                  {label || (
-                    <span className="text-text-dim italic">
-                      unlabeled feature
-                    </span>
+                  {r.label || (
+                    <span className="text-text-dim italic">unlabeled feature</span>
                   )}
-                  {label && r.label_model && <ExplainerBadge model={r.label_model} />}
+                  {r.label && r.label_model && <ExplainerBadge model={r.label_model} />}
                 </span>
               </div>
               <div className="flex items-center gap-2 pl-8">
-                <div className="h-1.5 bg-bg-panel relative overflow-hidden flex-1">
+                <div className="h-1 bg-bg-panel relative overflow-hidden flex-1">
                   <div
                     className="absolute top-0 bottom-0 left-0 transition-[width] duration-500"
                     style={{ width: `${pct}%`, background: barColor }}
@@ -301,7 +397,7 @@ function FeatureColumn({
                   href={npHref}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-[9px] text-text-dim hover:text-amber-dim shrink-0"
+                  className="text-[9px] text-text-dim hover:text-amber-dim shrink-0 font-mono"
                   title="Open feature on Neuronpedia"
                 >
                   L{r.layer}·{r.feature_id} ↗
