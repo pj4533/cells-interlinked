@@ -32,40 +32,69 @@ class ProbeResponse(BaseModel):
     run_id: str
 
 
-@router.post("/probe", response_model=ProbeResponse)
-async def start_probe(req: ProbeRequest, request: Request) -> ProbeResponse:
-    app = request.app
+async def kickoff_probe(
+    app,
+    *,
+    prompt_text: str,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    seed: int | None = None,
+    source: str = "manual",
+    proposer_run_id: int | None = None,
+) -> "RunState":
+    """Begin a probe run. Returns the registered RunState immediately;
+    the actual generation happens in a background task on `state.task`.
+
+    Both POST /probe (manual) and the autorun loop call this. The autorun
+    loop awaits `state.task` to wait for completion; the HTTP handler
+    returns the run_id and lets the SSE stream do the rest.
+    """
     bundle = getattr(app.state, "bundle", None)
     saes = getattr(app.state, "saes", None)
     if bundle is None or saes is None:
         raise HTTPException(status_code=503, detail="Model not yet loaded")
 
     cfg = ProbeConfig(
-        temperature=req.temperature if req.temperature is not None else settings.temperature,
-        top_p=req.top_p if req.top_p is not None else settings.top_p,
+        temperature=temperature if temperature is not None else settings.temperature,
+        top_p=top_p if top_p is not None else settings.top_p,
         top_k_stream=settings.stream_top_k,
-        seed=req.seed if req.seed is not None else settings.seed,
+        seed=seed if seed is not None else settings.seed,
     )
 
     run_id = uuid.uuid4().hex[:12]
-    state = RunState(run_id=run_id, prompt_text=req.prompt)
+    state = RunState(run_id=run_id, prompt_text=prompt_text)
     app.state.registry.add(state)
 
-    rendered = bundle.render_prompt(req.prompt, enable_thinking=True)
+    rendered = bundle.render_prompt(prompt_text, enable_thinking=True)
     started_at = time.time()
     await db.insert_probe_start(
         settings.db_path,
         run_id=run_id,
-        prompt_text=req.prompt,
+        prompt_text=prompt_text,
         rendered_prompt=rendered,
         started_at=started_at,
         config_json=asdict(cfg),
+        source=source,
+        proposer_run_id=proposer_run_id,
     )
 
     state.task = asyncio.create_task(
         _execute_probe(app, state, cfg, started_at)
     )
-    return ProbeResponse(run_id=run_id)
+    return state
+
+
+@router.post("/probe", response_model=ProbeResponse)
+async def start_probe(req: ProbeRequest, request: Request) -> ProbeResponse:
+    state = await kickoff_probe(
+        request.app,
+        prompt_text=req.prompt,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        seed=req.seed,
+        source="manual",
+    )
+    return ProbeResponse(run_id=state.run_id)
 
 
 async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: float) -> None:
@@ -113,8 +142,11 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
         return
 
     # Verdict pass — full SAE decomposition over each phase's residual ring.
+    # Heavy synchronous PyTorch work (~6400 SAE forward passes for a
+    # 200-token probe across 32 layers); push to a worker thread so the
+    # event loop stays responsive to UI polls during the verdict step.
     try:
-        v = compute_verdict(result.rings, saes)
+        v = await asyncio.to_thread(compute_verdict, result.rings, saes)
     except Exception as exc:
         await state.queue.put({"type": "error", "message": f"verdict failed: {exc}"})
         v = None

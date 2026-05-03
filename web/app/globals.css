@@ -219,6 +219,18 @@ input[data-vk]:focus, textarea[data-vk]:focus {
   animation: overlay-progress-anim 1.6s ease-in-out infinite;
 }
 
+/* ---------------- Autorun page pulse ----------------
+   Soft cyan dot that breathes while the loop is active. CSS-only so it
+   keeps animating during long polls and tab focus changes. */
+@keyframes autorun-pulse-anim {
+  0%, 100% { opacity: 0.85; box-shadow: 0 0 6px rgba(94, 229, 229, 0.55); transform: scale(1); }
+  50%      { opacity: 0.45; box-shadow: 0 0 14px rgba(94, 229, 229, 0.95); transform: scale(1.25); }
+}
+.autorun-pulse {
+  display: inline-block;
+  animation: autorun-pulse-anim 1.6s ease-in-out infinite;
+}
+
 /* Corner crosshair brackets framing the overlay for cinematic chrome. */
 .overlay-bracket {
   position: absolute;

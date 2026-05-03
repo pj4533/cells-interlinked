@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 import torch
@@ -11,10 +12,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from ..config import settings
+from ..pipeline.autorun import AutorunController
 from ..pipeline.labels import init_labels_table
 from ..pipeline.model_loader import load_model
 from ..pipeline.sae_runner import SAEManager
 from ..storage import db
+from .routes_autorun import router as autorun_router
+from .routes_journal import router as journal_router
 from .routes_probe import router as probe_router
 from .routes_stream import router as stream_router
 from .runs import RunRegistry
@@ -54,6 +58,17 @@ async def lifespan(app: FastAPI):
     app.state.saes = saes
     app.state.registry = RunRegistry()
 
+    # Autorun controller — singleton; the loop is created on demand by
+    # POST /autorun/start. Persisted state in `autorun_state` is not
+    # auto-resumed across server restarts: we always boot in `stopped`
+    # so the first run after a crash is deliberate.
+    autorun = AutorunController(db_path=settings.db_path)
+    autorun.app = app
+    app.state.autorun = autorun
+    await db.set_autorun_running(
+        settings.db_path, running=False, event="server-restart", ts=time.time()
+    )
+
     logger.info(
         "ready: model layers=%d hidden=%d  SAE layers=%d",
         bundle.num_layers,
@@ -64,6 +79,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Stop autorun cleanly so the loop doesn't outlive the app.
+        if autorun.running:
+            await autorun.stop()
         logger.info("shutting down")
 
 
@@ -84,6 +102,8 @@ def create_app() -> FastAPI:
 
     app.include_router(probe_router)
     app.include_router(stream_router)
+    app.include_router(autorun_router)
+    app.include_router(journal_router)
 
     @app.get("/health")
     def health() -> dict:

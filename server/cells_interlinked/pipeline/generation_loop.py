@@ -84,6 +84,70 @@ def _sample_next(
     return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
 
+# ---------- Synchronous compute kernels -----------------------------------
+#
+# These functions hold ALL the heavy CPU/GPU work for a probe — model
+# forward passes and SAE top-K encoding for 32 layers. We call them via
+# `await asyncio.to_thread(...)` so the asyncio event loop stays free to
+# service HTTP handlers (status polls, page loads, SSE streams to other
+# clients) while a probe is running.
+#
+# PyTorch ops on MPS release the GIL during the actual compute, so a
+# worker thread doing torch work doesn't fight the main thread for
+# Python time. Only one probe runs at a time (registry.lock serializes
+# them), so we never have two threads calling model.forward concurrently.
+
+def _initial_forward_blocking(
+    model, input_ids: torch.Tensor
+) -> tuple[Any, torch.Tensor]:
+    """Run the prompt's first forward pass. Returns (past_kv, next_logits)."""
+    with torch.no_grad():
+        out = model(input_ids, use_cache=True)
+    return out.past_key_values, out.logits[0, -1, :].float()
+
+
+def _step_compute_blocking(
+    model,
+    hooks: "ResidualHooks",
+    saes: SAEManager,
+    top_k: int,
+    tok: torch.Tensor,
+    past_kv: Any,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[Any, torch.Tensor, torch.Tensor, list[tuple[int, list[int], list[float]]]]:
+    """One generation step's worth of synchronous compute:
+       1. forward pass for `tok` (1 token) → updates KV cache
+       2. stack last-position residuals across hooked layers
+       3. for each layer, run streaming top-K through the SAE
+
+    Returns: (new_past_kv, next_logits, layer_residuals, streams)
+    where `streams` is a per-layer list of (layer_idx, indices, values)
+    pre-converted to plain Python lists so the calling async code can
+    just dump them straight into the event queue.
+    """
+    with torch.no_grad():
+        out = model(
+            tok.view(1, 1).to(device),
+            past_key_values=past_kv,
+            use_cache=True,
+        )
+    new_past_kv = out.past_key_values
+    next_logits = out.logits[0, -1, :].float()
+
+    layer_residuals = hooks.stack_last(dtype=dtype, device=device)
+    hooks.reset()
+
+    streams: list[tuple[int, list[int], list[float]]] = []
+    for li, layer_idx in enumerate(saes.layer_indices):
+        indices, values = saes.encode_topk(
+            layer_idx, layer_residuals[li], top_k
+        )
+        streams.append((layer_idx, indices.tolist(), values.tolist()))
+
+    return new_past_kv, next_logits, layer_residuals, streams
+
+
 # ---------- Probe runner ----------
 
 
@@ -185,11 +249,12 @@ async def run_probe(
     })
 
     try:
-        # Initial prompt forward — discard prompt residuals (we only stream generation).
-        with torch.no_grad():
-            out = bundle.model(input_ids, use_cache=True)
-        past_kv = out.past_key_values
-        next_logits = out.logits[0, -1, :].float()
+        # Initial prompt forward — discard prompt residuals (we only stream
+        # generation). Pushed off the event loop so a long prompt doesn't
+        # freeze /autorun/status polling for hundreds of ms.
+        past_kv, next_logits = await asyncio.to_thread(
+            _initial_forward_blocking, bundle.model, input_ids
+        )
         hooks.reset()
 
         for step in range(cfg.safety_cap):
@@ -235,18 +300,22 @@ async def run_probe(
             else:
                 decoded = bundle.raw_tokenizer.decode([token_id], skip_special_tokens=False)
 
-            # Forward this single token to get residuals AT this token.
-            with torch.no_grad():
-                out = bundle.model(
-                    tok.view(1, 1).to(bundle.device),
-                    past_key_values=past_kv,
-                    use_cache=True,
-                )
-            past_kv = out.past_key_values
-            next_logits = out.logits[0, -1, :].float()
-
-            layer_residuals = hooks.stack_last(dtype=bundle.dtype, device=bundle.device)
-            hooks.reset()
+            # Forward + per-layer SAE encode for this token. ALL of this
+            # is synchronous PyTorch work (~250-350ms total: ~30-80ms for
+            # the forward, ~5-10ms × 32 layers for the SAE top-K). Without
+            # to_thread it would block the event loop for that whole
+            # interval, freezing UI polls and SSE deliveries.
+            past_kv, next_logits, layer_residuals, streams = await asyncio.to_thread(
+                _step_compute_blocking,
+                bundle.model,
+                hooks,
+                saes,
+                cfg.top_k_stream,
+                tok,
+                past_kv,
+                bundle.dtype,
+                bundle.device,
+            )
 
             # Push to ring for the phase this token belongs to.
             ring = rings[phase_for_token]
@@ -261,11 +330,9 @@ async def run_probe(
                 "position": step,
             })
 
-            # Stream top-K per layer.
-            for li, layer_idx in enumerate(saes.layer_indices):
-                indices, values = saes.encode_topk(
-                    layer_idx, layer_residuals[li], cfg.top_k_stream
-                )
+            # Stream top-K per layer (already pre-computed by the worker
+            # thread; here we just push the events).
+            for layer_idx, ind_list, val_list in streams:
                 await queue.put({
                     "type": "activation",
                     "phase": phase_for_token.value,
@@ -273,7 +340,7 @@ async def run_probe(
                     "layer": layer_idx,
                     "features": [
                         {"id": int(i), "strength": float(v)}
-                        for i, v in zip(indices.tolist(), values.tolist())
+                        for i, v in zip(ind_list, val_list)
                     ],
                 })
 

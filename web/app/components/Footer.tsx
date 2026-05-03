@@ -6,6 +6,8 @@ export default function Footer() {
       <div className="space-x-6">
         <Link href="/" className="hover:text-amber">cells interlinked</Link>
         <Link href="/archive" className="hover:text-amber">archive</Link>
+        <Link href="/autorun" className="hover:text-cyan">autorun</Link>
+        <Link href="/journal" className="hover:text-cyan">journal</Link>
         <Link href="/baseline" className="hover:text-amber-dim">baseline</Link>
         <Link href="/fine-print" className="hover:text-amber">read the fine print</Link>
       </div>

@@ -17,6 +17,7 @@ dependencies = [
     "pydantic>=2.7",
     "python-dotenv>=1.0",
     "numpy>=1.26",
+    "anthropic>=0.97.0",
 ]
 
 [dependency-groups]
