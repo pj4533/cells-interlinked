@@ -172,20 +172,15 @@ async def run_proposer(db_path: Path) -> int:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    try:
-        # Cap the worker so a runaway never holds memory hostage. With
-        # the swap-out architecture and the default 60-probe batch:
-        # load ~30s, generation ~10-15 min on Qwen3-14B fp16/MPS at the
-        # observed ~10 tok/s on this box (slower than initial estimate),
-        # so 25 min is generous but bounded.
-        stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=payload), timeout=1500.0
-        )
-    except asyncio.TimeoutError:
-        logger.error("proposer: worker timeout — killing")
-        proc.kill()
-        await proc.wait()
-        raise RuntimeError("proposer worker timed out (1500s)")
+    # No timeout. The swap-out architecture has the autorun loop
+    # blocked on this subprocess by design — there's no other work
+    # being starved while we wait, and the runner model is unloaded
+    # so we're not squatting on MPS either. If the worker truly hangs,
+    # the autorun page will show 'RUNNING' indefinitely; the escape
+    # hatch is `pkill -f proposer_worker` (or restart the backend),
+    # which makes proc.communicate return non-zero and the controller's
+    # except block reloads the runner so autorun can resume.
+    stdout_b, stderr_b = await proc.communicate(input=payload)
 
     stderr_text = stderr_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:
