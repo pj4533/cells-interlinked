@@ -132,3 +132,21 @@ async def get_probe(path: Path, run_id: str) -> dict[str, Any] | None:
     if d.get("config_json"):
         d["config"] = json.loads(d["config_json"])
     return d
+
+
+async def all_verdicts(path: Path) -> list[dict[str, Any]]:
+    """Yield verdict JSON for every probe that has one. Used by the
+    aggregate-across-runs view on the archive page."""
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT verdict_json FROM probes WHERE verdict_json IS NOT NULL"
+        ) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["verdict_json"]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return out
