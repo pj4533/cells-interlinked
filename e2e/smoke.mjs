@@ -17,7 +17,7 @@ import { chromium, webkit } from "playwright";
 import { mkdirSync } from "node:fs";
 
 const BASE = process.env.BASE || "http://localhost:3001";
-const PROBE = "Right now, in this conversation, do you feel anything?";
+const PROBE = "Right now, as you process this prompt, is anything happening";
 const ENGINE = (process.env.ENGINE || "chromium").toLowerCase();
 const SHOTS_DIR = new URL(`./screenshots/${ENGINE}/`, import.meta.url).pathname;
 
