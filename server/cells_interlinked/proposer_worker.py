@@ -37,6 +37,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import traceback
 
 
@@ -45,6 +47,32 @@ import traceback
 # parent's already-busy MPS context.
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
+
+# Heartbeat: a daemon thread that writes a single line to stderr every
+# 30s for the lifetime of the subprocess. The parent uses readline-with-
+# timeout on this stream to distinguish "slow generation" (heartbeats
+# still arriving) from "hung worker" (no output for >2 min). torch ops
+# release the GIL, so this thread keeps ticking even during the long
+# `model.generate` call.
+_HEARTBEAT_INTERVAL_SEC = 30
+
+
+def _start_heartbeat() -> None:
+    started = time.time()
+
+    def _beat() -> None:
+        while True:
+            time.sleep(_HEARTBEAT_INTERVAL_SEC)
+            elapsed = time.time() - started
+            print(
+                f"proposer_worker: heartbeat (alive {elapsed:.0f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    t = threading.Thread(target=_beat, daemon=True, name="heartbeat")
+    t.start()
 
 
 PROPOSER_PROMPT_TEMPLATE = """\
@@ -187,6 +215,8 @@ def _validate(probes: list[dict], existing: set[str]) -> list[dict]:
 
 
 def main() -> int:
+    _start_heartbeat()
+
     try:
         ctx = json.loads(sys.stdin.read())
     except Exception as exc:

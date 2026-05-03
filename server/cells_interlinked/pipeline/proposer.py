@@ -145,12 +145,20 @@ async def _gather_context(db_path: Path, *, n: int) -> dict:
     }
 
 
+# Hang detection: the worker emits a heartbeat to stderr every 30s.
+# If we go this long without ANY stderr line, the worker is genuinely
+# hung (not just slow-generating) — kill it and surface the failure.
+# 4× the worker's heartbeat interval, so transient hiccups don't
+# trigger a false-positive kill.
+_STDERR_SILENCE_KILL_SEC = 120.0
+
+
 async def run_proposer(db_path: Path) -> int:
     """Spawn the worker subprocess, wait for it to finish, ingest its
     JSON output, return the count of new probes inserted.
 
-    Raises on subprocess failure (non-zero exit) — the controller catches
-    and surfaces in the proposer status panel."""
+    Raises on subprocess failure (non-zero exit) or hang detection —
+    the controller catches and surfaces in the proposer status panel."""
     n_target = settings.proposer_batch_size
     ctx = await _gather_context(db_path, n=n_target)
     payload = json.dumps(ctx).encode("utf-8")
@@ -172,26 +180,48 @@ async def run_proposer(db_path: Path) -> int:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    # No timeout. The swap-out architecture has the autorun loop
-    # blocked on this subprocess by design — there's no other work
-    # being starved while we wait, and the runner model is unloaded
-    # so we're not squatting on MPS either. If the worker truly hangs,
-    # the autorun page will show 'RUNNING' indefinitely; the escape
-    # hatch is `pkill -f proposer_worker` (or restart the backend),
-    # which makes proc.communicate return non-zero and the controller's
-    # except block reloads the runner so autorun can resume.
-    stdout_b, stderr_b = await proc.communicate(input=payload)
+    # Push the input payload, then close stdin so the worker's
+    # `sys.stdin.read()` returns. Don't await EOF here — we want to be
+    # reading stderr concurrently so the hang detector can fire.
+    proc.stdin.write(payload)
+    await proc.stdin.drain()
+    proc.stdin.close()
 
-    stderr_text = stderr_b.decode("utf-8", errors="replace")
+    # Drain stderr line-by-line, with a per-line timeout. Each readline
+    # has up to _STDERR_SILENCE_KILL_SEC to produce SOMETHING (heartbeat
+    # or progress line); if it doesn't, the worker is hung. Slow
+    # generation keeps emitting heartbeats, so this never trips on slow
+    # but healthy workers.
+    stderr_lines: list[str] = []
+    while True:
+        try:
+            line = await asyncio.wait_for(
+                proc.stderr.readline(), timeout=_STDERR_SILENCE_KILL_SEC
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "proposer: no stderr output for %.0fs — worker is hung; killing",
+                _STDERR_SILENCE_KILL_SEC,
+            )
+            proc.kill()
+            await proc.wait()
+            raise RuntimeError(
+                f"proposer worker hung (no output for {_STDERR_SILENCE_KILL_SEC:.0f}s)"
+            )
+        if not line:
+            break  # EOF — worker has closed stderr (i.e. is exiting)
+        text = line.decode("utf-8", errors="replace").rstrip()
+        stderr_lines.append(text)
+        # Forward worker progress to the backend log so a long cycle is
+        # visible in real time (heartbeats included).
+        logger.info("proposer_worker: %s", text)
+
+    stdout_b = await proc.stdout.read()
+    await proc.wait()
+
     if proc.returncode != 0:
-        # The worker might have written partial diagnostics to stderr —
-        # surface those upward so the proposer status panel can show them.
-        msg = stderr_text.strip().splitlines()[-1] if stderr_text else "unknown"
-        logger.error(
-            "proposer: worker exited %d — %s",
-            proc.returncode,
-            stderr_text[-2000:] if stderr_text else "(no stderr)",
-        )
+        msg = stderr_lines[-1] if stderr_lines else "unknown"
+        logger.error("proposer: worker exited %d — last line: %s", proc.returncode, msg)
         raise RuntimeError(f"proposer worker exited {proc.returncode}: {msg}")
 
     stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
