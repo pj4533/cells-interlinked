@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import psutil
+
 from ..config import settings
 from ..storage import db
 from . import probe_queue
@@ -69,11 +71,12 @@ class AutorunEvent:
 
 @dataclass
 class ProposerStatus:
-    state: str = "idle"  # 'idle' | 'running' | 'failed'
+    state: str = "idle"  # 'idle' | 'running' | 'failed' | 'skipped'
     started_at: float | None = None
     finished_at: float | None = None
     last_count: int = 0           # how many probes the last run produced
     last_error: str | None = None
+    last_skip_reason: str | None = None  # set when state='skipped'
 
 
 @dataclass
@@ -179,6 +182,20 @@ class AutorunController:
                 # the same lock inside _execute_probe.
                 if self._stop_requested:
                     break
+
+                # If a proposer subprocess is currently loading Qwen3-14B,
+                # do NOT start a new probe — peak resident of parent
+                # (~44 GB R1+SAEs + working set) plus subprocess (~28 GB
+                # Qwen3-14B fp16) plus an active autoregressive loop is
+                # over the 64 GB unified-memory budget on this box and
+                # OOM's the kernel. Wait for the proposer to exit first;
+                # the subprocess releases its weights back to the OS the
+                # moment it terminates, so memory is reclaimed before the
+                # next probe runs.
+                await self._await_proposer_idle()
+                if self._stop_requested:
+                    break
+
                 try:
                     state = await kickoff_probe(
                         self.app,
@@ -267,14 +284,57 @@ class AutorunController:
             await asyncio.sleep(min(step, total - elapsed))
             elapsed += step
 
+    async def _await_proposer_idle(self) -> None:
+        """If the proposer subprocess is currently running, block until
+        it finishes. Used to gate `kickoff_probe` so the parent isn't
+        running an active probe while the subprocess is loading
+        Qwen3-14B's weights (~28 GB on top of the parent's ~44 GB)."""
+        if self._proposer_task is None or self._proposer_task.done():
+            return
+        if self._proposer.state != "running":
+            return
+        self._log(
+            "proposer",
+            "pausing autorun until proposer subprocess exits (memory budget)",
+        )
+        try:
+            await self._proposer_task
+        except Exception:
+            # Errors are already captured into self._proposer.last_error
+            # by _run_proposer; we just need to unblock.
+            pass
+
     async def _maybe_kick_proposer(self) -> None:
-        """If queue depth is below the trigger threshold and no proposer
-        run is currently in flight, spawn one."""
+        """If queue depth is below the trigger threshold, no proposer run
+        is in flight, and free system memory is above the safety floor,
+        spawn one."""
         depth = await probe_queue.queue_depth(self.db_path)
         if depth["total_remaining"] >= settings.proposer_trigger_depth:
             return
         if self._proposer.state == "running":
             return
+
+        # Memory budget guard: refuse to spawn if free memory would put
+        # us over the unified-memory budget once Qwen3-14B (~28 GB) loads
+        # on top of the parent (R1-Distill + 32 SAEs + working set).
+        # psutil.virtual_memory().available is the OS estimate of how
+        # much can be allocated without swap pressure — the right metric
+        # here. Use it instead of `free` (which excludes file cache).
+        free_gb = psutil.virtual_memory().available / (1024**3)
+        if free_gb < settings.proposer_min_free_gb:
+            msg = (
+                f"queue depth {depth['total_remaining']} < trigger "
+                f"{settings.proposer_trigger_depth}, but free RAM {free_gb:.1f} GB "
+                f"< floor {settings.proposer_min_free_gb:.1f} GB — skipping proposer"
+            )
+            # Don't spam the log every iteration; only emit when state
+            # transitions into 'skipped'.
+            if self._proposer.state != "skipped":
+                self._log("proposer", msg)
+            self._proposer.state = "skipped"
+            self._proposer.last_skip_reason = msg
+            return
+
         # Lazy-import the proposer orchestrator so the controller doesn't
         # have a hard dep on Phase 3 being built yet — if proposer.py
         # is missing or its dependencies aren't installed the autorun
@@ -288,12 +348,14 @@ class AutorunController:
         self._log(
             "proposer",
             f"queue depth {depth['total_remaining']} < trigger "
-            f"{settings.proposer_trigger_depth}; kicking proposer",
+            f"{settings.proposer_trigger_depth}; free RAM {free_gb:.1f} GB; "
+            f"kicking proposer",
         )
         self._proposer.state = "running"
         self._proposer.started_at = time.time()
         self._proposer.finished_at = None
         self._proposer.last_error = None
+        self._proposer.last_skip_reason = None
         self._proposer_task = asyncio.create_task(
             self._run_proposer(proposer)
         )
@@ -325,5 +387,6 @@ class AutorunController:
                 "finished_at": self._proposer.finished_at,
                 "last_count": self._proposer.last_count,
                 "last_error": self._proposer.last_error,
+                "last_skip_reason": self._proposer.last_skip_reason,
             },
         }

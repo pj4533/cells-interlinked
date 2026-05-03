@@ -30,11 +30,12 @@ interface AutorunStatus {
   stop_requested: boolean;
   current_run_id: string | null;
   proposer: {
-    state: "idle" | "running" | "failed";
+    state: "idle" | "running" | "failed" | "skipped";
     started_at: number | null;
     finished_at: number | null;
     last_count: number;
     last_error: string | null;
+    last_skip_reason: string | null;
   };
   recent_log: Array<{
     ts: number;
@@ -212,6 +213,7 @@ export default function AutorunPage() {
           finishedAt={status.proposer.finished_at}
           lastCount={status.proposer.last_count}
           lastError={status.proposer.last_error}
+          lastSkipReason={status.proposer.last_skip_reason}
           batchSize={status.config.batch_size}
         />
       </section>
@@ -408,19 +410,22 @@ function ProposerStatus({
   finishedAt,
   lastCount,
   lastError,
+  lastSkipReason,
   batchSize,
 }: {
-  state: "idle" | "running" | "failed";
+  state: "idle" | "running" | "failed" | "skipped";
   startedAt: number | null;
   finishedAt: number | null;
   lastCount: number;
   lastError: string | null;
+  lastSkipReason: string | null;
   batchSize: number;
 }) {
   const pillColor = {
     idle: "text-text-dim",
     running: "text-cyan cyan-glow",
     failed: "text-warning",
+    skipped: "text-amber",
   }[state];
   return (
     <Pane title="proposer" subtitle={`Qwen3-14B · target ${batchSize} probes / swap`}>
@@ -450,6 +455,11 @@ function ProposerStatus({
         {lastError && (
           <div className="text-warning text-[10px] mt-3 font-mono italic">
             last error: {lastError}
+          </div>
+        )}
+        {state === "skipped" && lastSkipReason && (
+          <div className="text-amber text-[10px] mt-3 font-mono italic">
+            skipped: {lastSkipReason}
           </div>
         )}
       </div>

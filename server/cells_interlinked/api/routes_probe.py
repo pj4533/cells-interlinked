@@ -198,6 +198,18 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
         labels=labels if v is not None else None,
     )
 
+    # Drop intermediate MPS allocations now that the probe and its verdict
+    # are fully committed. Per-probe transient buffers (KV cache, residual
+    # ring views, SAE encode scratch) accumulate slack across a long
+    # autorun batch otherwise — slack that compounds with the proposer
+    # subprocess's 28 GB Qwen3-14B load and pushes a 64 GB box over.
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
     await state.queue.put({"type": "done"})
     state.completed = True
 

@@ -74,6 +74,14 @@ class Settings:
     # proposer doesn't bias toward its own thinking style.
     proposer_model: str = os.getenv("PROPOSER_MODEL", "Qwen/Qwen3-14B")
 
+    # Hard floor on system free memory (GB) below which the autorun loop
+    # refuses to spawn the proposer subprocess. The parent already holds
+    # ~44 GB (R1-Distill 8B + 32 SAEs); a Qwen3-14B fp16 load adds another
+    # ~28 GB. On a 64 GB box that's only safe when free memory is high.
+    # Set to ~32 GB by default — leaves slack for the OS, browser, and the
+    # parent's own working set during a probe.
+    proposer_min_free_gb: float = float(os.getenv("PROPOSER_MIN_FREE_GB", "32"))
+
     # ----- Analyzer (journal report generation, frontier API) -----
     # Anthropic SDK reads ANTHROPIC_API_KEY from env directly.
     analyzer_model: str = os.getenv("ANALYZER_MODEL", "claude-opus-4-7")
