@@ -1,5 +1,12 @@
 // Verify HTTP responsiveness during an active probe.
 //
+// ⚠️  WRITES TO LIVE DB. This script briefly starts autorun (which runs
+// one real probe through the model and writes a row to the probes
+// table) before stopping itself. If autorun was already off when you
+// started, it will be off again when this script finishes — but the
+// extra probe row stays in the archive. Run only when you're OK with
+// that.
+//
 // Kicks off autorun, then samples /autorun/status and /probes/recent
 // every 250ms while a probe is running. Records p50/p95/max latency.
 // Before the to_thread refactor: latencies routinely 250-400ms (a
