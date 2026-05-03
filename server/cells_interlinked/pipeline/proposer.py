@@ -174,17 +174,18 @@ async def run_proposer(db_path: Path) -> int:
 
     try:
         # Cap the worker so a runaway never holds memory hostage. With
-        # the swap-out architecture and 80-probe batches: load ~30s,
-        # generation ~5-7 min on Qwen3-14B fp16/MPS, so 15 min is
-        # generous but bounded.
+        # the swap-out architecture and the default 60-probe batch:
+        # load ~30s, generation ~10-15 min on Qwen3-14B fp16/MPS at the
+        # observed ~10 tok/s on this box (slower than initial estimate),
+        # so 25 min is generous but bounded.
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(input=payload), timeout=900.0
+            proc.communicate(input=payload), timeout=1500.0
         )
     except asyncio.TimeoutError:
         logger.error("proposer: worker timeout — killing")
         proc.kill()
         await proc.wait()
-        raise RuntimeError("proposer worker timed out (900s)")
+        raise RuntimeError("proposer worker timed out (1500s)")
 
     stderr_text = stderr_b.decode("utf-8", errors="replace")
     if proc.returncode != 0:

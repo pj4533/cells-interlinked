@@ -65,17 +65,19 @@ class Settings:
     # below this threshold, autorun kicks the proposer subprocess.
     proposer_trigger_depth: int = int(os.getenv("PROPOSER_TRIGGER_DEPTH", "3"))
 
-    # How many probes the proposer should produce per swap-in. The
-    # subprocess may produce fewer (rejection of duplicates against the
-    # curated set + already-used proposer set drops some).
+    # How many probes the proposer should produce per swap-in.
     #
-    # Sized for ~1 hour of autorun runtime per proposer cycle. Average
-    # probe runs ~45s + 10s gap = ~55s, so 60-70 probes / hour. Round up
-    # to 80 to allow for proposer dedup attrition (~10-20% gets dropped
-    # against the existing-prompts set). Each proposer swap-out costs
-    # ~2-3 minutes (unload + Qwen3-14B load + generate + reload), so an
-    # 80-probe batch makes the proposer overhead ~5% of runtime.
-    proposer_batch_size: int = int(os.getenv("PROPOSER_BATCH_SIZE", "80"))
+    # Sized for ~50-60 min of autorun runtime per proposer cycle. Average
+    # probe runs ~45s + 10s gap = ~55s. 60 probes × 55s = 55 min of
+    # runtime. Each proposer swap-out costs ~12-18 min (unload ~10s +
+    # Qwen3-14B load ~30s + generation 10-15 min at ~10 tok/s on MPS +
+    # reload ~60s), so the proposer overhead lands around 20-25% of total
+    # runtime — the trade for never having both models in memory at once.
+    #
+    # 80 was attempted first but consistently hit the 900s subprocess
+    # cap; 60 lands ~10-12 min generation on this box, well inside the
+    # new 1500s cap.
+    proposer_batch_size: int = int(os.getenv("PROPOSER_BATCH_SIZE", "60"))
 
     # The probe-proposer model. Different family from the runner so the
     # proposer doesn't bias toward its own thinking style.
