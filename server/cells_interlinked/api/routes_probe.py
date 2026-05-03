@@ -52,7 +52,13 @@ async def kickoff_probe(
     bundle = getattr(app.state, "bundle", None)
     saes = getattr(app.state, "saes", None)
     if bundle is None or saes is None:
-        raise HTTPException(status_code=503, detail="Model not yet loaded")
+        # Either the server is still warming up OR a proposer cycle has
+        # the runner model unloaded right now. Both look the same to the
+        # caller; the autorun page surfaces the proposer state separately.
+        raise HTTPException(
+            status_code=503,
+            detail="runner model is unloaded (proposer cycle in progress or server warming up)",
+        )
 
     cfg = ProbeConfig(
         temperature=temperature if temperature is not None else settings.temperature,

@@ -30,12 +30,12 @@ interface AutorunStatus {
   stop_requested: boolean;
   current_run_id: string | null;
   proposer: {
-    state: "idle" | "running" | "failed" | "skipped";
+    state: "idle" | "unloading" | "running" | "reloading" | "failed";
     started_at: number | null;
     finished_at: number | null;
     last_count: number;
     last_error: string | null;
-    last_skip_reason: string | null;
+    phase: string | null;
   };
   recent_log: Array<{
     ts: number;
@@ -213,7 +213,7 @@ export default function AutorunPage() {
           finishedAt={status.proposer.finished_at}
           lastCount={status.proposer.last_count}
           lastError={status.proposer.last_error}
-          lastSkipReason={status.proposer.last_skip_reason}
+          phase={status.proposer.phase}
           batchSize={status.config.batch_size}
         />
       </section>
@@ -410,23 +410,25 @@ function ProposerStatus({
   finishedAt,
   lastCount,
   lastError,
-  lastSkipReason,
+  phase,
   batchSize,
 }: {
-  state: "idle" | "running" | "failed" | "skipped";
+  state: "idle" | "unloading" | "running" | "reloading" | "failed";
   startedAt: number | null;
   finishedAt: number | null;
   lastCount: number;
   lastError: string | null;
-  lastSkipReason: string | null;
+  phase: string | null;
   batchSize: number;
 }) {
   const pillColor = {
     idle: "text-text-dim",
+    unloading: "text-amber",
     running: "text-cyan cyan-glow",
+    reloading: "text-amber",
     failed: "text-warning",
-    skipped: "text-amber",
   }[state];
+  const isCycling = state === "unloading" || state === "running" || state === "reloading";
   return (
     <Pane title="proposer" subtitle={`Qwen3-14B · target ${batchSize} probes / swap`}>
       <div className="px-4 py-4">
@@ -434,10 +436,15 @@ function ProposerStatus({
           <span className={`font-display text-lg tracking-widest ${pillColor}`}>
             {state.toUpperCase()}
           </span>
-          {state === "running" && (
+          {isCycling && (
             <span className="autorun-pulse h-1.5 w-1.5 rounded-full bg-cyan" />
           )}
         </div>
+        {isCycling && phase && (
+          <div className="text-amber/80 text-[10px] font-mono italic mb-3">
+            {phase}
+          </div>
+        )}
         <dl className="text-[10px] font-mono space-y-1.5 text-text-dim">
           <div className="flex justify-between">
             <dt className="text-text-dim/70">last batch</dt>
@@ -451,15 +458,14 @@ function ProposerStatus({
             <dt className="text-text-dim/70">finished</dt>
             <dd>{finishedAt ? formatRelative(finishedAt) : "—"}</dd>
           </div>
+          <div className="flex justify-between">
+            <dt className="text-text-dim/70">target / cycle</dt>
+            <dd>{batchSize} probes (~1h runtime)</dd>
+          </div>
         </dl>
         {lastError && (
           <div className="text-warning text-[10px] mt-3 font-mono italic">
             last error: {lastError}
-          </div>
-        )}
-        {state === "skipped" && lastSkipReason && (
-          <div className="text-amber text-[10px] mt-3 font-mono italic">
-            skipped: {lastSkipReason}
           </div>
         )}
       </div>

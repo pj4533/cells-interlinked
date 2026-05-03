@@ -68,19 +68,18 @@ class Settings:
     # How many probes the proposer should produce per swap-in. The
     # subprocess may produce fewer (rejection of duplicates against the
     # curated set + already-used proposer set drops some).
-    proposer_batch_size: int = int(os.getenv("PROPOSER_BATCH_SIZE", "20"))
+    #
+    # Sized for ~1 hour of autorun runtime per proposer cycle. Average
+    # probe runs ~45s + 10s gap = ~55s, so 60-70 probes / hour. Round up
+    # to 80 to allow for proposer dedup attrition (~10-20% gets dropped
+    # against the existing-prompts set). Each proposer swap-out costs
+    # ~2-3 minutes (unload + Qwen3-14B load + generate + reload), so an
+    # 80-probe batch makes the proposer overhead ~5% of runtime.
+    proposer_batch_size: int = int(os.getenv("PROPOSER_BATCH_SIZE", "80"))
 
     # The probe-proposer model. Different family from the runner so the
     # proposer doesn't bias toward its own thinking style.
     proposer_model: str = os.getenv("PROPOSER_MODEL", "Qwen/Qwen3-14B")
-
-    # Hard floor on system free memory (GB) below which the autorun loop
-    # refuses to spawn the proposer subprocess. The parent already holds
-    # ~44 GB (R1-Distill 8B + 32 SAEs); a Qwen3-14B fp16 load adds another
-    # ~28 GB. On a 64 GB box that's only safe when free memory is high.
-    # Set to ~32 GB by default — leaves slack for the OS, browser, and the
-    # parent's own working set during a probe.
-    proposer_min_free_gb: float = float(os.getenv("PROPOSER_MIN_FREE_GB", "32"))
 
     # ----- Analyzer (journal report generation, frontier API) -----
     # Anthropic SDK reads ANTHROPIC_API_KEY from env directly.

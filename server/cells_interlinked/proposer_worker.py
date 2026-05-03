@@ -243,9 +243,10 @@ def main() -> int:
     )
 
     # Generation budget: ~80 tokens per probe (text + tier + rationale +
-    # JSON punctuation), padded for slack. Cap at 6000 to keep the
-    # subprocess bounded.
-    max_new = min(6000, n * 120 + 500)
+    # JSON punctuation), padded for slack. Cap at 14000 so an 80-probe
+    # batch can't get truncated mid-array (which would lose the trailing
+    # `]` and break JSON parsing).
+    max_new = min(14000, n * 120 + 500)
     with torch.no_grad():
         out_ids = model.generate(
             **inputs,

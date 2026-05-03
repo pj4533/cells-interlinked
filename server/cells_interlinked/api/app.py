@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -27,15 +28,19 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db.init_db(settings.db_path)
-    logger.info("loading model+SAEs (this takes a minute)...")
-
-    dtype = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}[
+def _resolve_dtype() -> torch.dtype:
+    return {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}[
         settings.dtype
     ]
 
+
+async def load_runner_model(app: FastAPI) -> None:
+    """Load DeepSeek-R1 + 32 SAEs into MPS and stash on app.state.
+    Used both at startup and after a proposer subprocess unload/reload
+    cycle. Idempotent: returns immediately if already loaded."""
+    if getattr(app.state, "bundle", None) is not None:
+        return
+    dtype = _resolve_dtype()
     bundle = await asyncio.to_thread(
         load_model,
         settings.model_name,
@@ -46,17 +51,67 @@ async def lifespan(app: FastAPI):
         repo_id=settings.sae_repo,
         layer_indices=settings.hook_layers,
         d_model=bundle.hidden_dim,
-        # Llama-Scope-R1: expansion_factor=8, so d_sae = d_model * 8 = 32_768.
         d_sae=bundle.hidden_dim * 8,
         device=bundle.device,
         dtype=dtype,
     )
     await asyncio.to_thread(saes.load)
-    await init_labels_table(settings.db_path)
-
     app.state.bundle = bundle
     app.state.saes = saes
+    logger.info(
+        "ready: model layers=%d hidden=%d  SAE layers=%d",
+        bundle.num_layers,
+        bundle.hidden_dim,
+        saes.num_loaded,
+    )
+
+
+async def unload_runner_model(app: FastAPI) -> None:
+    """Tear down R1+SAEs from MPS so the proposer subprocess can have
+    the box to itself. After this returns, free RAM should rise by
+    ~44 GB. Caller (autorun) is expected to call load_runner_model()
+    after the subprocess exits."""
+    bundle = getattr(app.state, "bundle", None)
+    saes = getattr(app.state, "saes", None)
+    if bundle is None and saes is None:
+        return
+    logger.info("unloading runner model + SAEs to free MPS for proposer subprocess")
+    if saes is not None:
+        saes.unload()
+    if bundle is not None:
+        # Move to CPU first so MPS allocator releases the buffers, then
+        # drop the model. del + gc actually frees the unified-memory pages.
+        try:
+            bundle.model.to("cpu")
+        except Exception:
+            pass
+        bundle.model = None
+        bundle.tokenizer = None
+        bundle.raw_tokenizer = None
+    app.state.bundle = None
+    app.state.saes = None
+    # Force the garbage collector to walk now, before MPS empty_cache,
+    # so dropped Python references actually release their MPS buffers.
+    gc.collect()
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+        # Synchronize so the empty_cache actually completes before we
+        # spawn the subprocess.
+        torch.mps.synchronize()
+    logger.info("runner model + SAEs unloaded")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.init_db(settings.db_path)
+    await init_labels_table(settings.db_path)
+
     app.state.registry = RunRegistry()
+    app.state.bundle = None
+    app.state.saes = None
+
+    logger.info("loading model+SAEs (this takes a minute)...")
+    await load_runner_model(app)
 
     # Autorun controller — singleton; the loop is created on demand by
     # POST /autorun/start. Persisted state in `autorun_state` is not
@@ -69,17 +124,9 @@ async def lifespan(app: FastAPI):
         settings.db_path, running=False, event="server-restart", ts=time.time()
     )
 
-    logger.info(
-        "ready: model layers=%d hidden=%d  SAE layers=%d",
-        bundle.num_layers,
-        bundle.hidden_dim,
-        saes.num_loaded,
-    )
-
     try:
         yield
     finally:
-        # Stop autorun cleanly so the loop doesn't outlive the app.
         if autorun.running:
             await autorun.stop()
         logger.info("shutting down")
