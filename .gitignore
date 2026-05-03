@@ -44,6 +44,12 @@ next-env.d.ts
 # Local data (per-user runtime state — DBs, downloaded weights, run logs)
 data/
 server/data/
+# Exception: journal/data/reports/ is the published-report tree that the
+# publisher writes on `Publish`. It IS meant to be checked in (Vercel
+# reads it at build time). Without this un-ignore the publisher's
+# `git add` silently no-ops and nothing reaches the public site.
+!journal/data/
+!journal/data/**
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal
