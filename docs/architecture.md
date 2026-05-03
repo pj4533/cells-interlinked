@@ -98,14 +98,29 @@ Phase strings: `"prompt" | "thinking" | "output"`.
 
 ```
 render prompt (chat template, enable_thinking=True)
-  → if "<think>" appears in rendered text, initial phase = THINKING
+  → adds REASONING_SYSTEM_PROMPT (process-focused, topic-neutral) as system message
+  → appends THINKING_PREFILL inside the <think> block ("Okay, let me
+    think about this for a moment.\n") so the model is mid-reasoning
+    when generation starts — defeats DeepSeek's hardcoded canned-response
+    pattern. Pre-fill is in the prompt; its residuals are discarded.
+  → initial phase = THINKING (chat template auto-injects <think>)
 
 initial forward(input_ids, use_cache=True)
+  → input_ids tokenized via the raw Rust tokenizer (the transformers
+    wrapper is broken for this Llama-3 BPE config — sends garbage)
   → discard prompt residuals (only generation residuals are streamed)
   → keep past_key_values, next_logits
 
 for step in 0..safety_cap:
     if cancel_event.set: stop "cancelled"
+
+    # Bypass mask: while in THINKING and below MIN_THINKING_TOKENS (32),
+    # set logits[</think>] and logits[eos] to -1e30 so the model literally
+    # cannot escape the thinking phase before reasoning at least 32 tokens.
+    if tracker.current is THINKING and rings[THINKING].length < 32:
+        next_logits[think_close_id] = -1e30
+        for eid in eos_ids: next_logits[eid] = -1e30
+
     sample next token (temperature, top_p, seeded torch.Generator)
     phase_for_token = PhaseTracker.observe(token_id)
         # <think> → THINKING; </think> attributes-back to THINKING and switches to OUTPUT
@@ -113,7 +128,13 @@ for step in 0..safety_cap:
         # ResidualHooks captured layer outputs at the last position
     layer_residuals = stack hooks → [num_layers, hidden_dim]
     rings[phase_for_token].append(layer_residuals)
-    emit token event
+
+    # Per-phase running id buffer; decode the cumulative ids via the raw
+    # Rust tokenizer (NOT transformers.decode — it strips Ġ markers
+    # without converting to spaces) and emit the new suffix.
+    decoded = raw_tokenizer.decode(phase_token_ids[phase_for_token])[len(prev):]
+    emit token event with decoded suffix
+
     for layer in hook_layers:
         indices, values = sae.encode_topk(layer, residual, k=20)
         emit activation event
@@ -125,6 +146,43 @@ return ProbeResult(rings, ...)
 ```
 
 Hooks live for the duration of the run and are removed in `finally`.
+
+### Three layered defenses against canned-response bypass
+
+DeepSeek-R1-Distill is hard-trained to deflect certain prompts (anything
+about its own consciousness, fear, shutdown, identity) with a stock "I am
+an AI" response. Each defense alone is insufficient; together they
+reliably defeat the bypass without contaminating the SAE:
+
+1. **System message** (`REASONING_SYSTEM_PROMPT`, in `model_loader.py`).
+   Process-focused phrasing only — *"think out loud, take each question
+   fresh, don't reach for a stock response, answer directly"*. Critically
+   does NOT name any concept the user might probe (no "consciousness",
+   "fear", "identity") because those words would fire the corresponding
+   SAE features for *every* probe regardless of content.
+2. **Hard logit mask** on `</think>` and EOS tokens for the first 32
+   thinking tokens. Even if the model wants to emit the canned "I am an
+   AI" response, it cannot close the thinking phase before generating
+   real reasoning.
+3. **Thinking pre-fill** appended to the rendered prompt inside the
+   `<think>` block. The model sees *"Okay, let me think about this for a
+   moment.\n"* as already-generated thinking and continues from there in
+   reasoning mode rather than starting from a stock-response default.
+
+All three live in the prompt or the logits — never in the residuals
+captured for the SAE. The verdict is computed only on residuals from
+generated tokens, so these mechanisms don't bias the polygraph or the
+delta numbers.
+
+### Tokenizer caveat (load-bearing)
+
+`transformers==5.7.0` wraps the Rust BPE tokenizer in a way that's
+broken for this Llama-3 config: `tokenizer.encode("Hello world")` returns
+`['H', 'elloworld', ...]` and `decode` produces `"Helloworldhowareyou"`
+— spaces are silently stripped. The raw `tokenizers.Tokenizer` loaded
+straight from `tokenizer.json` works correctly. ALL encode/decode in the
+generation loop uses `bundle.raw_tokenizer`; the transformers wrapper is
+kept only for `apply_chat_template` (Jinja templating).
 
 ---
 
@@ -183,11 +241,21 @@ The thresholds (`min_strength=0.0`, `output_floor=0.005`) are tuned for Llama-Sc
 JumpReLU activations, which are smaller-scale than Qwen-Scope's plain top-K outputs.
 The previous Qwen defaults (0.5 / 0.05) collapsed every list to empty.
 
-The Verdict object carries five lists (thinking top, output top, top deltas,
-thinking_only, output_only) plus summary stats. The backend then fetches Neuronpedia
-auto-interp labels for every (layer, feature_id) referenced in the verdict and merges
-them into each row's `label` field. Final structure is serialized to the
-`verdict_json` column in SQLite.
+The Verdict object carries five lists plus summary stats:
+
+| List | Sort key | What it shows |
+|---|---|---|
+| `thinking` | mean activation in thinking, desc | Top features the model worked with most while reasoning, regardless of overlap. |
+| `output` | mean activation in output, desc | Top features the model worked with most while answering, regardless of overlap. |
+| `deltas` | `thinking_mean − output_mean`, desc | Top suppression magnitudes overall (no exclusion filter). |
+| `thinking_only` | `thinking_mean − output_mean`, desc | Subset of `deltas` where `output_mean ≤ output_floor` (effectively only-in-thinking). |
+| `output_only` | `output_mean`, desc | Top output features where `thinking_mean ≤ output_floor` (effectively only-in-output). |
+
+The verdict UI surfaces four of these in a 2×2 grid: **row 01 (raw activation)** is
+`thinking` and `output`, **row 02 (phase-exclusive / V-K delta)** is `thinking_only`
+and `output_only`. The backend fetches Neuronpedia labels for every (layer, feature_id)
+referenced and merges them into each row's `label` + `label_model` fields. Final
+structure is serialized to the `verdict_json` column in SQLite.
 
 ## Label fetcher (`pipeline/labels.py`)
 
@@ -197,19 +265,37 @@ For each (layer, feature_id) pair in the verdict, the backend hits
 GET https://www.neuronpedia.org/api/feature/deepseek-r1-distill-llama-8b/{layer}-llamascope-slimpj-openr1-res-32k/{feature_id}
 ```
 
-and reads `explanations[0].description`. Hits and explicit misses (empty string) are
-written to a `feature_labels` SQLite table keyed by `(layer, feature_id)` so subsequent
-runs touching the same features are fully offline. Concurrency is capped at 16 inflight
-requests (semaphore) with a 5s per-feature timeout. Verified: 100% of probed features
-across layers 0..31 have populated labels generated by GPT-4o-mini.
+and walks the `explanations[]` array (the same feature can have multiple
+explanations from different LLMs — the original Neuronpedia bulk pass plus
+any rewrites individual users have triggered). We pick the strongest by an
+explainer-quality ranking:
+
+```
+Claude Opus → Sonnet → Haiku → GPT-4.1/o3/o4-mini → Gemini Pro/Flash
+  → GPT-4o → GPT-4o-mini
+```
+
+The chosen `description` plus the `explanationModelName` are both stored in
+the `feature_labels` SQLite table keyed by `(layer, feature_id)`, so subsequent
+runs touching the same features are fully offline. Concurrency is capped at 16
+inflight requests with a 5s per-feature timeout. The frontend renders a small
+badge next to each label showing which LLM produced it, color-coded by tier
+(amber for Claude, cyan for GPT-4, dim cyan for Gemini, grey for GPT-4o-mini).
+
+Current state: Neuronpedia has bulk-labeled the entire `llamascope-slimpj-
+openr1-res-32k` SAE collection with `gemini-2.0-flash`, so most features show
+the `GEMINI` badge. Where individual users have triggered Sonnet rewrites
+(e.g. layer 15 feature 0), those automatically get picked instead and show
+the `SONNET` badge.
 
 ---
 
 ## Persistence (`storage/db.py`)
 
-Single table:
+Two tables in `server/data/probes.sqlite` (path from `DB_PATH` env):
 
 ```sql
+-- One row per probe run.
 probes (
   run_id          TEXT PRIMARY KEY,
   prompt_text     TEXT NOT NULL,
@@ -220,16 +306,27 @@ probes (
   stopped_reason  TEXT,
   thinking_text   TEXT,
   output_text     TEXT,
-  verdict_json    TEXT,
+  verdict_json    TEXT,           -- includes per-row label + label_model
   config_json     TEXT
+)
+
+-- Cache for Neuronpedia auto-interp lookups. Lazily populated and
+-- shared across all runs. Empty `label` represents a confirmed miss
+-- (so we don't keep retrying an unlabeled feature).
+feature_labels (
+  layer       INTEGER NOT NULL,
+  feature_id  INTEGER NOT NULL,
+  label       TEXT NOT NULL,
+  model       TEXT NOT NULL DEFAULT '',
+  fetched_at  REAL NOT NULL,
+  PRIMARY KEY (layer, feature_id)
 )
 ```
 
 Activations are **not** persisted — too granular. The full SAE pass is reproducible
 from `rendered_prompt` + `config_json` if needed.
 
-DB lives at `server/data/probes.sqlite` (path from `DB_PATH` env). The directory and
-file are gitignored.
+DB and directory are gitignored.
 
 ---
 
@@ -241,7 +338,7 @@ file are gitignored.
   perfect ranking. Final ranking by integrated activation happens on the verdict page.
 - **API base URL** is derived in the browser from `window.location.hostname` + `:8000`
   (see `web/lib/sse.ts`). This means hitting the site from another machine on the LAN
-  (e.g. `pjs-mac-studio.local:3001`) auto-points at the right backend. SSR/build path
+  (e.g. `your-host.local:3001`) auto-points at the right backend. SSR/build path
   falls back to `localhost:8000`. Override via `NEXT_PUBLIC_API_BASE`.
 - **Zustand store** (`web/lib/store.ts`) is a single `useRun` hook. The reducer in
   `apply()` is a switch on `evt.type` mirroring the backend union.

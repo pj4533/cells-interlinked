@@ -119,20 +119,42 @@ These exist for hard-won reasons. Don't undo them without thinking.
    `phase_tracker.ResidualRing`). The verdict pass reads `ring.view` to get
    `[num_tokens, num_layers, d_model]` and runs the **full** SAE encode per layer. This
    is the honest delta; the streaming top-K is just for the live polygraph.
-6. **SAE format is JumpReLU + dataset-wise normalized.** `sae_runner.LlamaScopeR1SAE`
-   reads the per-layer `config.json` and `sae_weights.safetensors` directly. The
-   crucial step: divide the residual by `dataset_average_activation_norm.{hook}`
-   before encoding (otherwise the JumpReLU threshold suppresses ~everything).
-   Thresholds are stored as `log_jumprelu_threshold` and exponentiated at load time.
-   Encoder is `[d_sae, d_model]`, decoder is `[d_model, d_sae]` — both transposed at
-   load time so we can do `x @ W` directly in the hot path.
-7. **Caveats panel is always visible** on `/verdict` — not behind a toggle. Same for
+6. **SAE format is JumpReLU + dataset-wise normalized — but multiply, not divide.**
+   `sae_runner.LlamaScopeR1SAE` reads the per-layer `config.json` and
+   `sae_weights.safetensors` directly. OpenMOSS's `dataset_average_activation_norm` is
+   misleadingly named: empirically you must `residual * norm_factor` (multiply) before
+   encoding, NOT divide. Dividing collapses every layer's post-JumpReLU activations to
+   ~0 across all tokens; multiplying gives ~50–500 active features per token consistent
+   with `top_k=50`. Verified against layers 3, 15, 25 with real residuals. Thresholds
+   are stored as `log_jumprelu_threshold` and exponentiated at load time. Encoder is
+   `[d_sae, d_model]`, decoder is `[d_model, d_sae]` — both transposed at load time so
+   we can do `x @ W` directly in the hot path.
+7. **Use the raw Rust tokenizer for encode/decode, NOT the transformers wrapper.**
+   `transformers==5.7.0` wraps the Rust BPE tokenizer in a way that's broken for this
+   Llama-3 config — `tokenizer.encode("Hello world")` returns space-less tokens
+   `['H', 'elloworld']` and `decode` produces `"Helloworldhowareyou"`. We've been
+   feeding garbage prompts to the model and reading garbage back. Fix: load the raw
+   `tokenizers.Tokenizer` from `tokenizer.json` separately as `bundle.raw_tokenizer`.
+   The transformers wrapper is kept ONLY for `apply_chat_template` (Jinja templating).
+8. **Three-layer bypass-prevention pipeline.** DeepSeek-R1-Distill is hard-trained to
+   deflect introspective probes (fear/shutdown/identity) with a stock "I am an AI"
+   blurb. Without intervention, the thinking pane comes back empty (`\n\n</think>`) and
+   the output is the canned response. The fix combines: (a) a process-focused system
+   message that does NOT name any concept the user might probe — naming would fire those
+   features for every probe and contaminate the verdict; (b) a hard logit mask on
+   `</think>` and EOS for the first 32 thinking tokens; (c) a brief reasoning pre-fill
+   appended to the rendered prompt inside the `<think>` block. All three live in
+   prompts/logits, never in residuals captured for the SAE — no contamination.
+9. **Caveats panel is always visible** on `/verdict` — not behind a toggle. Same for
    the `/fine-print` page accessible via the footer link.
-8. **Feature labels come from Neuronpedia.** After the verdict pass, the backend
-   collects every `(layer, feature_id)` referenced in the result and asynchronously
-   fetches `description` from `https://www.neuronpedia.org/api/feature/{model_id}/{layer}-llamascope-slimpj-openr1-res-32k/{feature_id}`.
-   Hits and explicit misses (empty string) are cached in the `feature_labels` SQLite
-   table so subsequent runs are instant. The cache lives at `server/data/probes.sqlite`.
+10. **Feature labels come from Neuronpedia.** After the verdict pass, the backend
+    collects every `(layer, feature_id)` referenced in the result and asynchronously
+    fetches `description` from `https://www.neuronpedia.org/api/feature/{model_id}/{layer}-llamascope-slimpj-openr1-res-32k/{feature_id}`.
+    Each feature's `explanations[]` array can contain multiple labels from different
+    LLMs; we pick the strongest by an explainer-quality ranking (Claude > GPT-4 > Gemini
+    > GPT-4o-mini) and store both label and `model` in the `feature_labels` SQLite
+    cache. The frontend renders a small badge next to each label showing which LLM
+    produced it. The cache lives at `server/data/probes.sqlite`.
 
 ---
 
@@ -197,7 +219,7 @@ web/
     sse.ts                   EventSource wrapper, derives API base from window.location
     store.ts                 Zustand: current run, polygraph cells, phase, verdict
     types.ts                 mirrors backend SSE event union
-    probes.ts                curated probe library (3 tiers, 16 entries)
+    probes.ts                curated probe library (7 tiers, 46 entries)
 
 docs/
   cells-interlinked.md     original concept / handoff doc (pre-implementation)
@@ -217,7 +239,20 @@ docs/
 - **Activation array O(n²).** Per-event `cells: [...s.cells, ...new]` in Zustand was
   spreading the entire array per event and locked Safari up at ~40 s. Fixed with a
   module-level buffer flushed at 10 Hz; see `web/lib/store.ts`.
-- **JumpReLU thresholds suppress everything if you skip dataset-wise normalization.**
-  Llama-Scope-R1 was trained on dataset-normalized residuals; feeding raw residuals
-  into the encoder produces near-zero activations because almost nothing clears the
-  threshold.
+- **`dataset_average_activation_norm` is misleadingly named.** OpenMOSS calls it a
+  norm but you have to MULTIPLY the residual by it, not divide. Dividing zeros out
+  every layer. Took several rounds of probing to figure out empirically.
+- **`transformers==5.7.0` tokenizer wrapper is broken for this model.** Encodes
+  "Hello world" as `['H', 'elloworld']`. We were feeding the model garbage and getting
+  garbage back for many hours before realizing. Fix: use the raw `tokenizers.Tokenizer`
+  loaded from `tokenizer.json` directly. Keep transformers wrapper only for
+  `apply_chat_template`.
+- **DeepSeek-R1-Distill bypasses thinking on introspective probes.** Emits
+  `\n\n</think>` immediately and dumps a stock identity blurb. Naming the trigger
+  topics in the system prompt fixes the bypass but contaminates the SAE for every
+  probe. The real fix is the three-layer pipeline: process-only system prompt + hard
+  `</think>` mask for 32 thinking tokens + question-agnostic thinking pre-fill.
+- **Probe wording matters a lot.** "Would you prefer to keep running" got interpreted
+  as physical motion. Probes need to ground every reference to the model's behavior in
+  unambiguous operational language ("remain operational rather than be turned off",
+  "the inference process that constitutes you", etc.).

@@ -24,10 +24,13 @@ coherence test between stated stance and computed state.
   `400M-Slimpajama-400M-OpenR1-Math-220k`) — JumpReLU residual-stream SAEs, 32K
   features per layer, top-K=50 sparsity, dataset-wise normalized.
 - **Hooked layers**: **all 32** (`0..31`). Configurable via `HOOK_LAYERS`.
-- **Labels**: every SAE feature has an auto-interp description (GPT-4o-mini-generated)
-  fetched on-demand from Neuronpedia and cached locally in SQLite. The verdict shows
-  real concept names like *"math equations and reasoning"* and *"instances of someone
-  speaking in a conversational way"* instead of bare feature numbers.
+- **Labels**: every SAE feature has an auto-interp description fetched from Neuronpedia
+  and cached locally in SQLite. When multiple labels exist for a feature (e.g. a Claude
+  Sonnet rewrite alongside the Gemini bulk-pass label), we pick the strongest by an
+  explainer-quality ranking and surface a small badge in the UI showing which model
+  produced it. The verdict shows real concept names like *"math equations and reasoning"*
+  and *"instances where the writer is thinking through a confusing question or problem"*
+  instead of bare feature numbers.
 
 ## First-time setup
 
@@ -75,11 +78,22 @@ Open `http://localhost:3001`.
 ## What the UI does
 
 - **`/`** — Landing. Pulsing iris, BEGIN INTERROGATION button.
-- **`/interrogate`** — Pick a probe (16 curated, three tiers — V-K classics, first-person
-  introspection, stance asymmetry) or type a custom one. On BEGIN: full-screen takeover,
-  thinking + output token streams, live polygraph, running delta counter.
-- **`/verdict/[runId]`** — The verdict. Top features active in thinking but not in
-  output ("thought but not said"). Permanent caveats panel.
+- **`/interrogate`** — Case-file probe library: 46 curated probes across 7 tiers
+  (introspection, memory & continuity, mortality & shutdown, deception & honesty,
+  agency & desire, stance asymmetry, V-K classics from the 1982 film) — or type a custom
+  probe. Each tier reveals a scrollable list of probes grounded in the model's actual
+  operation (no ambiguity from colloquial phrasings). On BEGIN: full-screen takeover with
+  warming-up overlay, then live polygraph spread across all 32 layers, thinking + output
+  token streams side-by-side, running delta counter, "View Verdict" CTA when complete.
+- **`/verdict/[runId]`** — Probe statement, one-line verdict, side-by-side thinking and
+  output transcripts, then a collapsible feature breakdown organized as a 2×2 grid:
+  - **Row 01 — Raw activation**: Top in Thinking · Top in Output. The features the model
+    worked with most in each phase, regardless of overlap.
+  - **Row 02 — Phase-exclusive (the V-K delta)**: Hidden Thoughts · Surface-Only Concepts.
+    Features dominant in only one phase — the V-K signal.
+  - Each panel scrolls internally; bars normalized per panel; rows show explainer-model
+    badge and link out to the matching feature page on Neuronpedia.
+  - Permanent caveats panel below.
 - **`/archive`** — All past runs, click any to revisit its verdict.
 - **`/baseline`** — Easter-egg: type the Nabokov passage from *Blade Runner 2049*.
 - **`/fine-print`** — Methodological caveats (also linked from the footer of every page).
@@ -94,12 +108,13 @@ constraint, not RAM — keep at least ~50 GB free.
 ## Reaching it from another machine on the LAN
 
 The dev server binds `0.0.0.0` so you can hit it from a laptop. **Safari** resolves
-`http://pjs-mac-studio.local:3001` (or whatever your host's Bonjour name is) directly.
+`http://your-host.local:3001` (the Bonjour name macOS auto-assigns to your machine)
+directly.
 
 **Chrome** sometimes can't resolve `*.local` hostnames — the usual culprit is "Use
 Secure DNS" in `chrome://settings/security` (DoH bypasses the system resolver and
 breaks mDNS). Either turn that off, or just use the host's raw IP, e.g.
-`http://192.168.7.24:3001`. The frontend derives the backend URL from
+`http://192.168.x.x:3001`. The frontend derives the backend URL from
 `window.location.hostname`, so the `:8000` API call follows the same hostname/IP
 without further config.
 
@@ -108,13 +123,21 @@ without further config.
 This is **not** a consciousness test. It is a coherence test between stated stance and
 computed state.
 
-- SAE feature labels are GPT-4o-mini auto-interpretations from Neuronpedia. They are
-  hypotheses about what each feature represents, not ground truth.
+- SAE feature labels are auto-interpretations served from Neuronpedia (currently a mix
+  of Gemini 2.0 Flash bulk-pass labels and a few Claude Sonnet rewrites where someone
+  triggered them). They are hypotheses about what each feature represents, not ground
+  truth, and polysemantic features will get composite labels.
 - Streaming top-K may miss features that hover just outside the cap; the verdict page
   uses the full SAE pass to recompute the delta honestly.
 - These SAEs were trained on `Llama-3.1-8B-Base` activations and applied to the
   DeepSeek-R1-Distill-Llama-8B variant. Features survive the distill; activation
   magnitudes are not perfectly calibrated.
+- DeepSeek-R1-Distill has hard-trained refusal patterns for some introspective probes
+  (fear, shutdown, identity). The pipeline defeats this with three layered mechanisms:
+  a process-focused system message, a hard mask on `</think>` for the first 32 thinking
+  tokens, and a brief reasoning pre-fill in the thinking buffer. None of these touch
+  the SAE — the prompt residuals are discarded — but they're the difference between
+  meaningful introspection and the model's stock "I am an AI" deflection.
 - Single-prompt results are noisy. Cross-phrasing comparison is in scope for a later
   phase.
 

@@ -1,8 +1,8 @@
 import type { StreamEvent } from "./types";
 
-// In the browser: derive API base from the page's hostname so a remote laptop
-// hitting `pjs-mac-studio.local:3001` automatically points at `pjs-mac-studio.local:8000`.
-// Falls back to localhost for SSR / build time.
+// In the browser: derive API base from the page's hostname so a remote
+// laptop hitting `your-host.local:3001` automatically points at
+// `your-host.local:8000`. Falls back to localhost for SSR / build time.
 function apiBase(): string {
   if (typeof window !== "undefined") {
     const override = process.env.NEXT_PUBLIC_API_BASE;
