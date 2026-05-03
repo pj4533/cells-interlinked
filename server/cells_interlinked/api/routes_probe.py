@@ -180,8 +180,20 @@ async def cancel_probe(run_id: str, request: Request) -> dict:
 
 
 @router.get("/probes/recent")
-async def list_recent() -> list:
-    return await db.list_recent(settings.db_path, limit=50)
+async def list_recent(limit: int = 10, offset: int = 0) -> dict:
+    """Paginated list of past runs.
+
+    Defaults to 10 per page so the archive UI can flip through history
+    without dumping everything at once. Returns the current page's rows
+    plus the total count so the frontend can render page controls.
+    """
+    # Clamp to reasonable bounds — never let a client demand the full
+    # archive in one shot.
+    limit = max(1, min(int(limit), 100))
+    offset = max(0, int(offset))
+    rows = await db.list_recent(settings.db_path, limit=limit, offset=offset)
+    total = await db.count_probes(settings.db_path)
+    return {"rows": rows, "total": total, "limit": limit, "offset": offset}
 
 
 # Minimum number of distinct runs a feature has to appear in (in the same

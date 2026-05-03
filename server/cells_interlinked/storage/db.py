@@ -107,16 +107,25 @@ def _verdict_to_dict(
     }
 
 
-async def list_recent(path: Path, limit: int = 50) -> list[dict[str, Any]]:
+async def list_recent(
+    path: Path, *, limit: int = 50, offset: int = 0
+) -> list[dict[str, Any]]:
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, stopped_reason "
-            "FROM probes ORDER BY started_at DESC LIMIT ?",
-            (limit,),
+            "FROM probes ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def count_probes(path: Path) -> int:
+    async with aiosqlite.connect(path) as db:
+        async with db.execute("SELECT COUNT(*) FROM probes") as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
 
 
 async def get_probe(path: Path, run_id: str) -> dict[str, Any] | None:
