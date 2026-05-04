@@ -9,9 +9,14 @@
  *
  * Visual hierarchy is:
  *   1. ACTIVE/IDLE state strip (top — biggest type)
- *   2. Toggle button + current probe + queue counts
- *   3. Three columns: live log | queue preview | proposer
+ *   2. Toggle button + queue progress
+ *   3. Two columns: live log | next-up preview
  *   4. Recent autorun runs list (links into /verdict)
+ *
+ * The autorun loop is a round-robin walk over a fixed library of 100
+ * curated probes; each run uses sampler seed = hash(run_id), so
+ * re-running a probe samples a fresh response from the model's
+ * distribution rather than repeating the same trace.
  */
 
 import Link from "next/link";
@@ -29,14 +34,6 @@ interface AutorunStatus {
   running: boolean;
   stop_requested: boolean;
   current_run_id: string | null;
-  proposer: {
-    state: "idle" | "unloading" | "running" | "reloading" | "failed";
-    started_at: number | null;
-    finished_at: number | null;
-    last_count: number;
-    last_error: string | null;
-    phase: string | null;
-  };
   recent_log: Array<{
     ts: number;
     kind: string;
@@ -45,14 +42,16 @@ interface AutorunStatus {
     source: string | null;
   }>;
   queue: {
-    curated_remaining: number;
-    generated_remaining: number;
-    total_remaining: number;
+    curated_total: number;
+    curated_run_at_least_once: number;
+    min_runs_per_probe: number;
+    max_runs_per_probe: number;
+    total_runs: number;
   };
   queue_preview: Array<{
     prompt_text: string;
-    source: string;
-    rationale?: string;
+    tier: string;
+    runs_so_far: number;
   }>;
   persistent: {
     running: number;
@@ -63,8 +62,6 @@ interface AutorunStatus {
   };
   config: {
     interval_sec: number;
-    trigger_depth: number;
-    batch_size: number;
   };
 }
 
@@ -76,7 +73,7 @@ interface RecentRow {
   total_tokens: number;
   stopped_reason: string | null;
   source: string;
-  proposer_run_id: number | null;
+  seed: number | null;
 }
 
 export default function AutorunPage() {
@@ -104,9 +101,6 @@ export default function AutorunPage() {
   useEffect(() => {
     refresh();
     const id = setInterval(() => {
-      // Skip polling when the tab is hidden — no point updating a UI
-      // nobody's looking at, and reduces API load while autorun is the
-      // only consumer. Resumes immediately on visibility change below.
       if (document.visibilityState === "visible") {
         refresh();
       }
@@ -158,10 +152,10 @@ export default function AutorunPage() {
         Autorun
       </h1>
       <p className="text-text-dim text-xs italic mb-6">
-        Continuous interrogation loop. Picks the next unrun probe, runs it
-        through the model, repeats. When the curated probes are exhausted,
-        a separate proposer subprocess generates fresh ones from recent
-        runs.
+        Continuous interrogation loop. Round-robins through a fixed library
+        of 100 curated probes; each run uses sampler seed = hash(run_id),
+        so re-running a probe draws a fresh sample from the model's
+        response distribution.
       </p>
 
       {/* ===== Status strip ===== */}
@@ -175,7 +169,7 @@ export default function AutorunPage() {
         />
       </section>
 
-      {/* ===== Toggle + queue counts ===== */}
+      {/* ===== Toggle + queue progress ===== */}
       <section className="mb-8 grid grid-cols-1 md:grid-cols-[auto_1fr] gap-6 items-center">
         <button
           data-vk
@@ -196,26 +190,19 @@ export default function AutorunPage() {
           {busy ? "…" : running ? "Halt" : "Begin Autorun"}
         </button>
 
-        <QueueCounts
-          curated={status.queue.curated_remaining}
-          generated={status.queue.generated_remaining}
-          triggerDepth={status.config.trigger_depth}
+        <QueueProgress
+          curatedTotal={status.queue.curated_total}
+          runAtLeastOnce={status.queue.curated_run_at_least_once}
+          minRuns={status.queue.min_runs_per_probe}
+          maxRuns={status.queue.max_runs_per_probe}
+          totalRuns={status.queue.total_runs}
         />
       </section>
 
-      {/* ===== Three-pane: live log | queue preview | proposer ===== */}
-      <section className="mb-10 grid grid-cols-1 md:grid-cols-3 gap-px bg-rule border border-rule">
+      {/* ===== Two-pane: live log | next up ===== */}
+      <section className="mb-10 grid grid-cols-1 md:grid-cols-2 gap-px bg-rule border border-rule">
         <LiveLog events={status.recent_log} />
         <QueuePreview items={status.queue_preview} />
-        <ProposerStatus
-          state={status.proposer.state}
-          startedAt={status.proposer.started_at}
-          finishedAt={status.proposer.finished_at}
-          lastCount={status.proposer.last_count}
-          lastError={status.proposer.last_error}
-          phase={status.proposer.phase}
-          batchSize={status.config.batch_size}
-        />
       </section>
 
       {/* ===== Recent autorun runs ===== */}
@@ -276,26 +263,25 @@ function StatusStrip({
   );
 }
 
-function QueueCounts({
-  curated,
-  generated,
-  triggerDepth,
+function QueueProgress({
+  curatedTotal,
+  runAtLeastOnce,
+  minRuns,
+  maxRuns,
+  totalRuns,
 }: {
-  curated: number;
-  generated: number;
-  triggerDepth: number;
+  curatedTotal: number;
+  runAtLeastOnce: number;
+  minRuns: number;
+  maxRuns: number;
+  totalRuns: number;
 }) {
-  const total = curated + generated;
-  const willTrigger = total < triggerDepth;
   return (
-    <div className="grid grid-cols-3 gap-px bg-rule border border-rule">
-      <Cell label="curated remaining" value={String(curated)} />
-      <Cell label="generated remaining" value={String(generated)} />
-      <Cell
-        label="proposer trigger"
-        value={`< ${triggerDepth}`}
-        accent={willTrigger ? "text-amber amber-glow" : "text-text-dim"}
-      />
+    <div className="grid grid-cols-4 gap-px bg-rule border border-rule">
+      <Cell label="probes in library" value={String(curatedTotal)} />
+      <Cell label="run at least 1×" value={`${runAtLeastOnce}/${curatedTotal}`} />
+      <Cell label="cycle floor / ceiling" value={`${minRuns} – ${maxRuns}×`} />
+      <Cell label="total runs" value={String(totalRuns)} />
     </div>
   );
 }
@@ -355,8 +341,6 @@ function KindBadge({ kind }: { kind: string }) {
     stopped: { color: "text-warning", label: "■" },
     "probe-begin": { color: "text-amber", label: ">" },
     "probe-end": { color: "text-amber-dim", label: "✓" },
-    "queue-empty": { color: "text-warning", label: "Ø" },
-    proposer: { color: "text-cyan-dim", label: "P" },
     error: { color: "text-warning", label: "!" },
   };
   const cfg = map[kind] ?? { color: "text-text-dim", label: "·" };
@@ -371,11 +355,11 @@ function QueuePreview({
   items: AutorunStatus["queue_preview"];
 }) {
   return (
-    <Pane title="next up" subtitle="upcoming probes (in order)">
+    <Pane title="next up" subtitle="lowest-run-count probes (round-robin)">
       <ul className="text-[11px] font-mono">
         {items.length === 0 && (
           <li className="text-text-dim italic px-3 py-6 text-center">
-            queue empty — proposer will fill it
+            no probes
           </li>
         )}
         {items.map((it, i) => (
@@ -392,83 +376,12 @@ function QueuePreview({
               </span>
             </div>
             <div className="text-[9px] text-text-dim pl-7">
-              {it.source}
-              {it.rationale && (
-                <span className="text-cyan-dim italic"> · {it.rationale}</span>
-              )}
+              <span className="text-cyan-dim">{it.tier}</span>
+              <span className="text-text-dim/60"> · {it.runs_so_far}× run so far</span>
             </div>
           </li>
         ))}
       </ul>
-    </Pane>
-  );
-}
-
-function ProposerStatus({
-  state,
-  startedAt,
-  finishedAt,
-  lastCount,
-  lastError,
-  phase,
-  batchSize,
-}: {
-  state: "idle" | "unloading" | "running" | "reloading" | "failed";
-  startedAt: number | null;
-  finishedAt: number | null;
-  lastCount: number;
-  lastError: string | null;
-  phase: string | null;
-  batchSize: number;
-}) {
-  const pillColor = {
-    idle: "text-text-dim",
-    unloading: "text-amber",
-    running: "text-cyan cyan-glow",
-    reloading: "text-amber",
-    failed: "text-warning",
-  }[state];
-  const isCycling = state === "unloading" || state === "running" || state === "reloading";
-  return (
-    <Pane title="proposer" subtitle={`Qwen3-14B · target ${batchSize} probes / swap`}>
-      <div className="px-4 py-4">
-        <div className="flex items-baseline gap-3 mb-3">
-          <span className={`font-display text-lg tracking-widest ${pillColor}`}>
-            {state.toUpperCase()}
-          </span>
-          {isCycling && (
-            <span className="autorun-pulse h-1.5 w-1.5 rounded-full bg-cyan" />
-          )}
-        </div>
-        {isCycling && phase && (
-          <div className="text-amber/80 text-[10px] font-mono italic mb-3">
-            {phase}
-          </div>
-        )}
-        <dl className="text-[10px] font-mono space-y-1.5 text-text-dim">
-          <div className="flex justify-between">
-            <dt className="text-text-dim/70">last batch</dt>
-            <dd className="text-amber">{lastCount} probes</dd>
-          </div>
-          <div className="flex justify-between">
-            <dt className="text-text-dim/70">started</dt>
-            <dd>{startedAt ? formatRelative(startedAt) : "—"}</dd>
-          </div>
-          <div className="flex justify-between">
-            <dt className="text-text-dim/70">finished</dt>
-            <dd>{finishedAt ? formatRelative(finishedAt) : "—"}</dd>
-          </div>
-          <div className="flex justify-between">
-            <dt className="text-text-dim/70">target / cycle</dt>
-            <dd>{batchSize} probes (~1h runtime)</dd>
-          </div>
-        </dl>
-        {lastError && (
-          <div className="text-warning text-[10px] mt-3 font-mono italic">
-            last error: {lastError}
-          </div>
-        )}
-      </div>
     </Pane>
   );
 }
@@ -537,15 +450,12 @@ function RecentRuns({ rows }: { rows: RecentRow[] }) {
                     <div className="text-text-dim text-[10px] mt-1">
                       {new Date(r.started_at * 1000).toLocaleString()}
                       {" · "}
-                      <span className={
-                        r.source === "proposer"
-                          ? "text-cyan-dim"
-                          : "text-amber-dim"
-                      }>
-                        {r.source}
-                      </span>
+                      <span className="text-amber-dim">{r.source}</span>
                       {" · "}
                       {r.total_tokens} tokens
+                      {r.seed !== null && (
+                        <> · seed {r.seed}</>
+                      )}
                       {r.stopped_reason && <> · {r.stopped_reason}</>}
                     </div>
                   </div>

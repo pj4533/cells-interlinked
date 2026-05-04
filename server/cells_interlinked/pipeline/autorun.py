@@ -1,28 +1,23 @@
-"""Autorun controller — drives probes through the model continuously.
+"""Autorun controller — drives curated probes through the model continuously.
 
-A single asyncio task runs the loop:
+Round-robin loop:
 
     while running:
-        item = next_probe(db_path)
-        if item is None:
-            request_proposer()        # background subprocess (Phase 3)
-            await sleep(idle_backoff) # then re-check
-            continue
-        state = kickoff_probe(...)    # via the same path POST /probe uses
-        commit_used(item, run_id)
-        await state.task              # wait for completion
-        await sleep(interval)         # gap so polygraph still feels live
+        item = pick_lowest_run_count_probe()
+        kickoff_probe(...)
+        await state.task
+        sleep(autorun_interval_sec)
 
-The controller is a singleton attached to `app.state.autorun`. All state
-that survives a server restart lives in the SQLite `autorun_state` row;
-in-process state (event log, current run id, proposer status) is held on
-the controller for the live UI.
+The proposer architecture is gone. We have a fixed library of 100
+curated prompts and we cycle through them; each run picks the prompt
+with the smallest run count (so the cycle covers all 100 before
+repeating any). Per-run sampler seed is hash(run_id), so re-running the
+same prompt produces a *distribution* of responses across the SAE
+polygraph — that distribution is the V-K signal we actually want.
 
-Stop semantics: `stop()` sets `_stop_requested`. The loop checks it after
-each completion and at the top of each idle backoff. It does NOT cancel
-an in-flight probe — that probe runs to completion and we stop after.
-This avoids leaving the SQLite row in a half-finished state and keeps
-the model lock release deterministic.
+Stop semantics: stop() sets _stop_requested. The loop checks it after
+each completion and at the top of each interval. It does NOT cancel an
+in-flight probe — the probe runs to completion and we stop after.
 """
 
 from __future__ import annotations
@@ -33,53 +28,26 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..config import settings
 from ..storage import db
 from . import probe_queue
 
-if TYPE_CHECKING:
-    from fastapi import FastAPI
-
 logger = logging.getLogger(__name__)
+
 
 # How many recent log lines to keep in memory for the live UI strip.
 _EVENT_LOG_CAPACITY = 50
-
-# When the queue is empty and the proposer hasn't been triggered yet,
-# wait this long before re-checking. Short so the UI feels responsive
-# once the proposer drops new probes; long enough not to spin.
-_IDLE_BACKOFF_SEC = 8.0
-
-# When the proposer is actively running, poll for completion at this
-# interval. Proposer runs take a few minutes (Qwen3-14B load + generate),
-# so polling every 10s is plenty.
-_PROPOSER_POLL_SEC = 10.0
 
 
 @dataclass
 class AutorunEvent:
     ts: float
-    kind: str       # 'started' | 'stopped' | 'probe-begin' | 'probe-end' | 'queue-empty' | 'proposer' | 'error'
+    kind: str       # 'started' | 'stopped' | 'probe-begin' | 'probe-end' | 'error'
     message: str
     run_id: str | None = None
     source: str | None = None
-
-
-@dataclass
-class ProposerStatus:
-    # 'idle'        — nothing in flight
-    # 'unloading'   — tearing down R1+SAEs to free MPS
-    # 'running'     — Qwen3-14B subprocess generating
-    # 'reloading'   — bringing R1+SAEs back so probes can resume
-    # 'failed'      — last cycle errored; details in last_error
-    state: str = "idle"
-    started_at: float | None = None
-    finished_at: float | None = None
-    last_count: int = 0
-    last_error: str | None = None
-    phase: str | None = None  # human-readable substate during a cycle
 
 
 @dataclass
@@ -93,16 +61,10 @@ class AutorunController:
     _loop_task: asyncio.Task | None = None
     _current_run_id: str | None = None
     _events: deque = field(default_factory=lambda: deque(maxlen=_EVENT_LOG_CAPACITY))
-    _proposer: ProposerStatus = field(default_factory=ProposerStatus)
-    _proposer_task: asyncio.Task | None = None
 
     @property
     def running(self) -> bool:
         return self._running
-
-    @property
-    def proposer_status(self) -> ProposerStatus:
-        return self._proposer
 
     def recent_events(self, limit: int = 20) -> list[dict]:
         events = list(self._events)[-limit:]
@@ -153,36 +115,15 @@ class AutorunController:
             return {"ok": True, "was_running": False}
         self._stop_requested = True
         self._log("stopped", "stop requested — will halt after current probe")
-        # Don't await the loop here; UI returns immediately. The loop will
-        # observe _stop_requested at its next checkpoint.
         return {"ok": True, "was_running": True}
 
     async def _run_loop(self) -> None:
-        # Lazy import to avoid a circular dependency: autorun.py is imported
-        # by app.py during lifespan; routes_probe.py imports `from ..pipeline
-        # ...` which would loop back through here if the import happened at
-        # module load time.
+        # Lazy import to avoid a circular dependency.
         from ..api.routes_probe import kickoff_probe
 
         try:
             while not self._stop_requested:
                 item = await probe_queue.next_probe(self.db_path)
-
-                if item is None:
-                    self._log("queue-empty", "no probes in queue — requesting proposer")
-                    await self._maybe_kick_proposer()
-                    # Wait, then re-check.
-                    await self._sleep_with_stop(_IDLE_BACKOFF_SEC)
-                    continue
-
-                # Drive the probe through the same path manual probes use.
-                # NOTE: don't hold registry.lock here — `_execute_probe`
-                # acquires it itself, and asyncio.Lock is not reentrant,
-                # so wrapping the kickoff would deadlock the await below.
-                # Serialization is fine: the autorun loop only kicks off
-                # one probe at a time and awaits it before continuing,
-                # and any concurrent manual probe naturally queues on
-                # the same lock inside _execute_probe.
                 if self._stop_requested:
                     break
 
@@ -190,35 +131,26 @@ class AutorunController:
                     state = await kickoff_probe(
                         self.app,
                         prompt_text=item.prompt_text,
-                        source=item.source,
-                        proposer_run_id=item.proposer_run_id,
+                        source="autorun",
                     )
                 except Exception as exc:
                     self._log("error", f"kickoff failed: {exc}")
-                    await self._sleep_with_stop(_IDLE_BACKOFF_SEC)
+                    await self._sleep_with_stop(settings.autorun_interval_sec)
                     continue
 
                 self._current_run_id = state.run_id
-                await probe_queue.commit_used(
-                    self.db_path, item, run_id=state.run_id
-                )
                 await db.bump_autorun_run(self.db_path, run_id=state.run_id)
                 self._log(
                     "probe-begin",
                     item.prompt_text[:80] + ("…" if len(item.prompt_text) > 80 else ""),
                     run_id=state.run_id,
-                    source=item.source,
+                    source="autorun",
                 )
-                # Wait for the probe task to finish. _execute_probe holds
-                # the model lock for the duration of generation + verdict.
-                #
-                # We MUST drain state.queue concurrently. For manual probes
-                # the SSE handler is the consumer; for autorun probes there
-                # is none, and the queue (cap 10000) backs up after ~300
-                # tokens (~33 events per token: 1 token + 32 activations),
-                # causing the forwarder → run_probe pipeline to deadlock on
-                # queue.put. The drained events are discarded — autorun
-                # reads the verdict from the DB after the run finishes.
+
+                # Drain state.queue concurrently so the runner doesn't
+                # deadlock on a backed-up queue (cap 10000 fills around
+                # ~300 generated tokens). Discarded — autorun reads the
+                # verdict from the DB after the run finishes.
                 async def _drain() -> None:
                     while True:
                         evt = await state.queue.get()
@@ -239,20 +171,15 @@ class AutorunController:
                             await drain_task
                         except asyncio.CancelledError:
                             pass
+
                 self._log(
                     "probe-end",
                     f"completed {state.run_id}",
                     run_id=state.run_id,
-                    source=item.source,
+                    source="autorun",
                 )
                 self._current_run_id = None
 
-                # Decide whether to kick the proposer in the background — do
-                # this OUTSIDE the model lock so it doesn't block the next
-                # autorun probe.
-                await self._maybe_kick_proposer()
-
-                # Inter-probe gap; checks stop every interval.
                 await self._sleep_with_stop(settings.autorun_interval_sec)
 
         finally:
@@ -265,108 +192,15 @@ class AutorunController:
             self._log("stopped", "autorun loop exited")
 
     async def _sleep_with_stop(self, total: float) -> None:
-        """Sleep up to `total` seconds, breaking early if stop is requested.
-        Polls every 0.5s — fine-grained enough that the user sees the loop
-        halt immediately without burning CPU."""
         elapsed = 0.0
         step = 0.5
         while elapsed < total and not self._stop_requested:
             await asyncio.sleep(min(step, total - elapsed))
             elapsed += step
 
-    async def _maybe_kick_proposer(self) -> None:
-        """If queue depth is below the trigger threshold, run a full
-        proposer cycle synchronously: unload R1+SAEs, spawn Qwen3-14B
-        subprocess, ingest its probes, reload R1+SAEs.
-
-        This blocks the autorun loop end-to-end (~5-7 minutes per cycle
-        with the default 80-probe batch). It MUST block, because the
-        runner model can't be in MPS at the same time as Qwen3-14B on
-        this 64 GB box. The trade is a few minutes of reload latency
-        every ~hour for a queue that doesn't OOM the kernel."""
-        depth = await probe_queue.queue_depth(self.db_path)
-        if depth["total_remaining"] >= settings.proposer_trigger_depth:
-            return
-
-        # Lazy-import the proposer orchestrator so the controller doesn't
-        # have a hard dep on Phase 3 being built yet.
-        try:
-            from . import proposer
-        except ImportError as exc:
-            self._log("proposer", f"proposer module unavailable: {exc}")
-            return
-
-        self._log(
-            "proposer",
-            f"queue depth {depth['total_remaining']} < trigger "
-            f"{settings.proposer_trigger_depth}; starting proposer swap-out cycle",
-        )
-        self._proposer.started_at = time.time()
-        self._proposer.finished_at = None
-        self._proposer.last_error = None
-        await self._run_proposer_cycle(proposer)
-
-    async def _run_proposer_cycle(self, proposer_mod) -> None:
-        """Full unload → spawn → reload sequence. Synchronous w.r.t. the
-        autorun loop on purpose — see _maybe_kick_proposer's docstring."""
-        from ..api.app import load_runner_model, unload_runner_model
-
-        try:
-            self._proposer.state = "unloading"
-            self._proposer.phase = "unloading runner + SAEs"
-            self._log("proposer", "unloading runner model + SAEs to free MPS")
-            t0 = time.time()
-            await unload_runner_model(self.app)
-            self._log("proposer", f"unload complete ({time.time() - t0:.1f}s)")
-
-            self._proposer.state = "running"
-            self._proposer.phase = "Qwen3-14B subprocess generating"
-            t1 = time.time()
-            count = await proposer_mod.run_proposer(self.db_path)
-            self._proposer.last_count = count
-            self._log(
-                "proposer",
-                f"proposer added {count} new probes ({time.time() - t1:.1f}s)",
-            )
-
-            self._proposer.state = "reloading"
-            self._proposer.phase = "reloading runner + SAEs"
-            self._log("proposer", "reloading runner model + SAEs")
-            t2 = time.time()
-            await load_runner_model(self.app)
-            self._log("proposer", f"reload complete ({time.time() - t2:.1f}s)")
-
-            self._proposer.state = "idle"
-            self._proposer.phase = None
-            self._proposer.finished_at = time.time()
-        except Exception as exc:
-            self._proposer.state = "failed"
-            self._proposer.phase = None
-            self._proposer.finished_at = time.time()
-            self._proposer.last_error = str(exc)
-            self._log("error", f"proposer cycle failed: {exc}")
-            # Best-effort: try to bring the runner back online even if
-            # the subprocess errored — otherwise autorun is wedged with
-            # no model loaded and every subsequent kickoff_probe 503s.
-            try:
-                await load_runner_model(self.app)
-            except Exception as reload_exc:
-                self._log(
-                    "error",
-                    f"runner reload after failed proposer also failed: {reload_exc}",
-                )
-
     def status_snapshot(self) -> dict:
         return {
             "running": self._running,
             "stop_requested": self._stop_requested,
             "current_run_id": self._current_run_id,
-            "proposer": {
-                "state": self._proposer.state,
-                "started_at": self._proposer.started_at,
-                "finished_at": self._proposer.finished_at,
-                "last_count": self._proposer.last_count,
-                "last_error": self._proposer.last_error,
-                "phase": self._proposer.phase,
-            },
         }

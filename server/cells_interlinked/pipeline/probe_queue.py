@@ -1,32 +1,30 @@
-"""Probe queue for the autorun loop.
+"""Probe queue for the autorun loop — round-robin over the curated set.
 
 Contract:
 
-    next_probe(db_path) -> ProbeQueueItem | None
+    next_probe(db_path) -> ProbeQueueItem
 
-Picks the next probe to run. Order of preference:
+Picks the next probe by walking the curated PROBES list and returning
+the one with the lowest run-count. Ties broken by file order (the
+order PROBES is defined in probes_library.py, which is interpretability-
+meaty tiers first, V-K-style "classic" tier last). After every probe
+has been run once, the next pick is whichever was run least, which on a
+freshly-cycled set is the first one again. So the loop is naturally
+round-robin.
 
-    1. The next curated probe (from probes_library.PROBES, in TIER_ORDER)
-       that has NOT already been used as a `prompt_text` on a probes row.
-    2. The oldest unused entry in `generated_probes` (proposer output).
-    3. None — caller should trigger the proposer to generate more.
+Re-runs are not duplicates — each run uses a different sampler seed
+(hash(run_id) at probe kickoff), so the same prompt produces a
+*distribution* of responses rather than the same trace every time.
 
-This deliberately exhausts curated probes first. The user's reasoning was:
-"start with curated probes round-robin, then proposer generates new
-probes per tier when curated exhausted; never repeat probe questions."
-
-A returned item has a `commit(run_id)` callback that the autorun loop
-invokes once a run actually starts — for generated probes this marks the
-row as used; for curated probes it's a no-op (the `probes` row insert
-itself is the dedupe signal).
+queue_depth() and queue_preview() exist for the UI; they don't gate
+anything in the loop. There is no "queue empty" state — the curated
+library is the queue.
 """
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from ..storage import db
 from .probes_library import probes_in_order
@@ -35,101 +33,62 @@ from .probes_library import probes_in_order
 @dataclass
 class ProbeQueueItem:
     prompt_text: str
-    source: str            # 'autorun' (curated) | 'proposer' (generated)
-    proposer_run_id: int | None
-    rationale: str | None  # only set for proposer items, for the live log
 
 
-def _curated_set() -> list[str]:
-    return [p.text for p in probes_in_order()]
+async def _run_counts(db_path: Path) -> dict[str, int]:
+    """{prompt_text: run_count} for every prompt in the curated set.
+    Prompts that have never run are returned with count=0."""
+    rows = await db.prompt_run_counts(db_path)
+    counts = {r["prompt_text"]: int(r["n"]) for r in rows}
+    return counts
 
 
-async def next_probe(db_path: Path) -> ProbeQueueItem | None:
-    used = await db.list_used_prompts(db_path)
-
-    # 1) Curated, in tier order — pick the first unrun one.
-    for text in _curated_set():
-        if text not in used:
-            return ProbeQueueItem(
-                prompt_text=text,
-                source="autorun",
-                proposer_run_id=None,
-                rationale=None,
-            )
-
-    # 2) Generated probes from the proposer.
-    unused = await db.list_unused_generated(db_path, limit=1)
-    if unused:
-        row = unused[0]
-        # Defensive: if a proposer-generated prompt happens to collide with
-        # something already in `probes` (shouldn't happen — UNIQUE constraint
-        # on prompt_text + we filter against used prompts when generating —
-        # but nothing in code prevents a proposer from echoing a curated
-        # probe verbatim), mark it used and try again.
-        if row["prompt_text"] in used:
-            await db.mark_generated_used(
-                db_path, gen_id=row["id"], used_at=time.time(), used_run_id="(skipped-dup)"
-            )
-            return await next_probe(db_path)
-        return ProbeQueueItem(
-            prompt_text=row["prompt_text"],
-            source="proposer",
-            proposer_run_id=row["id"],
-            rationale=row.get("rationale") or None,
-        )
-
-    # 3) Nothing in the queue — caller should kick the proposer.
-    return None
+async def next_probe(db_path: Path) -> ProbeQueueItem:
+    counts = await _run_counts(db_path)
+    curated = probes_in_order()
+    # Pick lowest run-count; ties broken by file order (i.e. earlier
+    # entries win) which is what the for-loop with strict-less gives.
+    best = curated[0]
+    best_n = counts.get(best.text, 0)
+    for p in curated[1:]:
+        n = counts.get(p.text, 0)
+        if n < best_n:
+            best = p
+            best_n = n
+    return ProbeQueueItem(prompt_text=best.text)
 
 
 async def queue_preview(db_path: Path, limit: int = 5) -> list[dict]:
     """Lookahead used by the /autorun/status endpoint to render the
-    'next up' strip in the UI."""
-    used = await db.list_used_prompts(db_path)
-    out: list[dict] = []
-    for text in _curated_set():
-        if len(out) >= limit:
-            break
-        if text not in used:
-            out.append({"prompt_text": text, "source": "autorun"})
-    if len(out) < limit:
-        rows = await db.list_unused_generated(db_path, limit=limit - len(out))
-        for r in rows:
-            out.append({
-                "prompt_text": r["prompt_text"],
-                "source": "proposer",
-                "rationale": r.get("rationale") or "",
-            })
-    return out
+    'next up' strip in the UI. Sorts curated probes by (count asc, file
+    order) and returns the first `limit`."""
+    counts = await _run_counts(db_path)
+    curated = probes_in_order()
+    indexed = list(enumerate(curated))
+    indexed.sort(key=lambda x: (counts.get(x[1].text, 0), x[0]))
+    return [
+        {
+            "prompt_text": p.text,
+            "tier": p.tier,
+            "runs_so_far": counts.get(p.text, 0),
+        }
+        for _, p in indexed[:limit]
+    ]
 
 
 async def queue_depth(db_path: Path) -> dict:
-    """Counts used by the controller to decide whether to kick the proposer."""
-    used = await db.list_used_prompts(db_path)
-    curated_remaining = sum(1 for t in _curated_set() if t not in used)
-    generated_remaining = await db.count_unused_generated(db_path)
+    """Snapshot of how many curated probes have been run, for the UI."""
+    counts = await _run_counts(db_path)
+    curated = probes_in_order()
+    total = len(curated)
+    run_at_least_once = sum(1 for p in curated if counts.get(p.text, 0) > 0)
+    min_runs = min((counts.get(p.text, 0) for p in curated), default=0)
+    max_runs = max((counts.get(p.text, 0) for p in curated), default=0)
+    total_runs = sum(counts.get(p.text, 0) for p in curated)
     return {
-        "curated_remaining": curated_remaining,
-        "generated_remaining": generated_remaining,
-        "total_remaining": curated_remaining + generated_remaining,
+        "curated_total": total,
+        "curated_run_at_least_once": run_at_least_once,
+        "min_runs_per_probe": min_runs,
+        "max_runs_per_probe": max_runs,
+        "total_runs": total_runs,
     }
-
-
-# Type alias so callers don't have to know the shape of the commit hook.
-CommitCallback = Callable[[str], Awaitable[None]]
-
-
-async def commit_used(
-    db_path: Path, item: ProbeQueueItem, *, run_id: str
-) -> None:
-    """Mark the queue item as consumed once a run for it has actually
-    started. Curated probes don't need a separate marker — the row in
-    `probes` is the dedup signal — but generated probes need their
-    `used_at` set so they don't get picked again."""
-    if item.source == "proposer" and item.proposer_run_id is not None:
-        await db.mark_generated_used(
-            db_path,
-            gen_id=item.proposer_run_id,
-            used_at=time.time(),
-            used_run_id=run_id,
-        )

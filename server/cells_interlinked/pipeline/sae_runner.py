@@ -230,14 +230,3 @@ class SAEManager:
     @property
     def num_loaded(self) -> int:
         return len(self.layers)
-
-    def unload(self) -> None:
-        """Drop every per-layer SAE so the parent process can free its
-        residency back to the OS before spawning the proposer subprocess.
-        Caller is responsible for `torch.mps.empty_cache()` + `gc.collect()`
-        after this returns."""
-        for sae in self.layers.values():
-            for attr in ("W_enc", "b_enc", "W_dec", "b_dec", "threshold", "norm_factor"):
-                if hasattr(sae, attr):
-                    setattr(sae, attr, None)
-        self.layers.clear()

@@ -32,6 +32,17 @@ class ProbeResponse(BaseModel):
     run_id: str
 
 
+def _seed_from_run_id(run_id: str) -> int:
+    """Derive a per-probe sampler seed from the run_id. Hash the hex
+    string to a positive 31-bit int so the same probe text re-run with a
+    different run_id gets a different seed (= a different sample from
+    the model's response distribution), while the seed for any given
+    run_id is reproducible if you ever want to replay it."""
+    import hashlib
+    h = hashlib.sha256(run_id.encode("utf-8")).digest()
+    return int.from_bytes(h[:4], "big") & 0x7FFFFFFF
+
+
 async def kickoff_probe(
     app,
     *,
@@ -40,7 +51,6 @@ async def kickoff_probe(
     top_p: float | None = None,
     seed: int | None = None,
     source: str = "manual",
-    proposer_run_id: int | None = None,
 ) -> "RunState":
     """Begin a probe run. Returns the registered RunState immediately;
     the actual generation happens in a background task on `state.task`.
@@ -48,26 +58,30 @@ async def kickoff_probe(
     Both POST /probe (manual) and the autorun loop call this. The autorun
     loop awaits `state.task` to wait for completion; the HTTP handler
     returns the run_id and lets the SSE stream do the rest.
+
+    The sampler seed defaults to hash(run_id) so each individual run is
+    reproducible (you can re-derive its seed from its run_id) AND
+    successive runs of the same prompt diverge — re-running a curated
+    probe samples from the model's response distribution instead of
+    repeating the same trace.
     """
     bundle = getattr(app.state, "bundle", None)
     saes = getattr(app.state, "saes", None)
     if bundle is None or saes is None:
-        # Either the server is still warming up OR a proposer cycle has
-        # the runner model unloaded right now. Both look the same to the
-        # caller; the autorun page surfaces the proposer state separately.
-        raise HTTPException(
-            status_code=503,
-            detail="runner model is unloaded (proposer cycle in progress or server warming up)",
-        )
+        raise HTTPException(status_code=503, detail="Model not yet loaded")
+
+    run_id = uuid.uuid4().hex[:12]
+
+    if seed is None:
+        seed = _seed_from_run_id(run_id)
 
     cfg = ProbeConfig(
         temperature=temperature if temperature is not None else settings.temperature,
         top_p=top_p if top_p is not None else settings.top_p,
         top_k_stream=settings.stream_top_k,
-        seed=seed if seed is not None else settings.seed,
+        seed=seed,
     )
 
-    run_id = uuid.uuid4().hex[:12]
     state = RunState(run_id=run_id, prompt_text=prompt_text)
     app.state.registry.add(state)
 
@@ -81,7 +95,7 @@ async def kickoff_probe(
         started_at=started_at,
         config_json=asdict(cfg),
         source=source,
-        proposer_run_id=proposer_run_id,
+        seed=seed,
     )
 
     state.task = asyncio.create_task(

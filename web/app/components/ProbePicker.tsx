@@ -209,11 +209,6 @@ export default function ProbePicker({ onBegin, disabled }: ProbePickerProps) {
             <span className="font-display text-[9px] text-amber-dim tracking-widest">
               loaded probe
             </span>
-            {!usingCustom && selectedProbe?.attribution && (
-              <span className="text-[10px] text-text-dim italic">
-                source: {selectedProbe.attribution}
-              </span>
-            )}
             {usingCustom && (
               <span className="font-display text-[9px] text-cyan tracking-widest">
                 custom

@@ -1,12 +1,13 @@
 """POST /autorun/start, /autorun/stop, GET /autorun/status, /autorun/recent.
 
-The autorun controller drives probes through the model in a loop without
-human input. The frontend polls /autorun/status every few seconds while
-the page is open; everything else is fire-and-forget.
+The autorun controller drives curated probes through the model in a
+round-robin loop. The frontend polls /autorun/status every few seconds
+while the page is open; everything else is fire-and-forget.
 """
 
 from __future__ import annotations
 
+import aiosqlite
 from fastapi import APIRouter, HTTPException, Request
 
 from ..config import settings
@@ -35,19 +36,18 @@ async def autorun_stop(request: Request) -> dict:
 
 @router.get("/autorun/status")
 async def autorun_status(request: Request) -> dict:
-    """One-shot snapshot used by the /autorun page poller. Bundles
-    everything the UI needs so the frontend doesn't fan out into 5
-    requests per tick.
+    """One-shot snapshot used by the /autorun page poller.
 
     Returns:
         running: bool
+        stop_requested: bool
         current_run_id: str | None
-        proposer: { state, started_at, finished_at, last_count, last_error }
         recent_log: [ { ts, kind, message, run_id, source }, ... ]
-        queue: { curated_remaining, generated_remaining, total_remaining }
-        queue_preview: [ { prompt_text, source, rationale? }, ... ]
-        persistent: row from autorun_state (lifetime_runs, last_change_at, etc.)
-        config: { interval_sec, trigger_depth, batch_size }
+        queue: { curated_total, curated_run_at_least_once,
+                 min_runs_per_probe, max_runs_per_probe, total_runs }
+        queue_preview: [ { prompt_text, tier, runs_so_far }, ... ]
+        persistent: row from autorun_state (total_runs, last_change_at, etc.)
+        config: { interval_sec }
     """
     ctrl = _controller(request)
     snap = ctrl.status_snapshot()
@@ -62,25 +62,21 @@ async def autorun_status(request: Request) -> dict:
         "persistent": persistent,
         "config": {
             "interval_sec": settings.autorun_interval_sec,
-            "trigger_depth": settings.proposer_trigger_depth,
-            "batch_size": settings.proposer_batch_size,
         },
     }
 
 
 @router.get("/autorun/recent")
 async def autorun_recent(limit: int = 20) -> dict:
-    """Recent runs initiated by the autorun loop (source = autorun OR
-    proposer). Filtering at the API layer (rather than reusing
-    /probes/recent) keeps the autorun page focused on its own activity."""
+    """Recent runs initiated by the autorun loop. Source is always
+    'autorun' now — proposer source is gone."""
     limit = max(1, min(int(limit), 100))
-    import aiosqlite, json
     async with aiosqlite.connect(settings.db_path) as conn:
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
-            "stopped_reason, source, proposer_run_id "
-            "FROM probes WHERE source IN ('autorun', 'proposer') "
+            "stopped_reason, source, seed "
+            "FROM probes WHERE source = 'autorun' "
             "ORDER BY started_at DESC LIMIT ?",
             (limit,),
         ) as cur:

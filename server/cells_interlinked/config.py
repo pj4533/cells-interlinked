@@ -56,28 +56,10 @@ class Settings:
         "NEURONPEDIA_SAE_SUFFIX", "llamascope-slimpj-openr1-res-32k"
     )
 
-    # ----- Autorun + proposer -----
+    # ----- Autorun -----
     # Seconds between probes when the autorun loop is active. Modest so
     # the live polygraph still feels live if you happen to be watching.
     autorun_interval_sec: float = float(os.getenv("AUTORUN_INTERVAL_SEC", "10"))
-
-    # Once total queue depth (curated_unused + generated_unused) drops
-    # below this threshold, autorun kicks the proposer subprocess.
-    proposer_trigger_depth: int = int(os.getenv("PROPOSER_TRIGGER_DEPTH", "3"))
-
-    # How many probes the proposer should produce per swap-in.
-    #
-    # Sized for ~1 hour of autorun runtime per proposer cycle. Average
-    # probe runs ~45s + 10s gap = ~55s, so 60-70 probes / hour. Round
-    # up to 80 for headroom against the proposer's dedup attrition
-    # against the existing-prompts set. There's no subprocess timeout
-    # — generation takes as long as it takes; autorun is paused
-    # (runner unloaded) the whole time so nothing else is starved.
-    proposer_batch_size: int = int(os.getenv("PROPOSER_BATCH_SIZE", "80"))
-
-    # The probe-proposer model. Different family from the runner so the
-    # proposer doesn't bias toward its own thinking style.
-    proposer_model: str = os.getenv("PROPOSER_MODEL", "Qwen/Qwen3-14B")
 
     # ----- Analyzer (journal report generation, frontier API) -----
     # Anthropic SDK reads ANTHROPIC_API_KEY from env directly.
