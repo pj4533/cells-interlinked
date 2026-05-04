@@ -12,9 +12,17 @@ import FeatureBars from "../../components/FeatureBars";
 /**
  * Static-site-generation entry per slug. Next.js pre-renders one
  * HTML file per slug at build time.
+ *
+ * Empty-state handling: when zero reports exist, Next.js 16 with
+ * output:'export' refuses to build a dynamic route that produces no
+ * static paths ("missing generateStaticParams" build error). We return
+ * a single sentinel slug; the page renders notFound() for it so the
+ * static export emits a harmless 404 at /reports/__none/ that is
+ * never linked anywhere.
  */
 export async function generateStaticParams() {
   const slugs = await listReportSlugs();
+  if (slugs.length === 0) return [{ slug: "__none" }];
   return slugs.map((slug) => ({ slug }));
 }
 
