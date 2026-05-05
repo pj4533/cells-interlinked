@@ -230,12 +230,54 @@ async def list_recent(
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
-            "stopped_reason, source, seed "
+            "stopped_reason, source, seed, abliterated "
             "FROM probes ORDER BY started_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
+
+
+async def list_by_prompt(
+    path: Path, *, prompt_text: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """All runs for a given prompt_text (most recent first). Used by the
+    verdict page to render the 'prior runs of this prompt' panel."""
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
+            "stopped_reason, source, seed, abliterated "
+            "FROM probes WHERE prompt_text = ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (prompt_text, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def verdicts_by_prompt(
+    path: Path, *, prompt_text: str
+) -> list[dict[str, Any]]:
+    """Yield every verdict_json for a given prompt_text, plus its
+    `abliterated` flag, so the per-prompt aggregate can split by regime
+    in a single round-trip."""
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT verdict_json, abliterated FROM probes "
+            "WHERE prompt_text = ? AND verdict_json IS NOT NULL",
+            (prompt_text,),
+        ) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        try:
+            v = json.loads(r["verdict_json"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        out.append({"verdict": v, "abliterated": int(r["abliterated"] or 0)})
+    return out
 
 
 async def count_probes(path: Path) -> int:

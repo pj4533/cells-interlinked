@@ -6,6 +6,9 @@ import Link from "next/link";
 import { motion } from "framer-motion";
 import CaveatsPanel from "../../components/CaveatsPanel";
 import ExplainerBadge from "../../components/ExplainerBadge";
+import AggregatePanel, {
+  type AggregateRow,
+} from "../../components/AggregatePanel";
 import type { DeltaEntry, FeatureSummary } from "@/lib/types";
 
 interface ProbeRecord {
@@ -16,6 +19,7 @@ interface ProbeRecord {
   total_tokens: number;
   stopped_reason: string;
   finished_at: number;
+  abliterated?: number | boolean | null;
   verdict?: {
     thinking: FeatureSummary[];
     output: FeatureSummary[];
@@ -24,6 +28,34 @@ interface ProbeRecord {
     output_only: DeltaEntry[];
     summary_stats: Record<string, number>;
   };
+}
+
+interface PriorRun {
+  run_id: string;
+  prompt_text: string;
+  started_at: number;
+  finished_at: number | null;
+  total_tokens: number;
+  stopped_reason: string | null;
+  abliterated?: number | boolean | null;
+}
+
+interface AggregatePromptBlock {
+  total_runs: number;
+  min_hits: number;
+  thinking_only: Array<
+    Omit<AggregateRow, "avg_value"> & { avg_delta: number }
+  >;
+  output_only: Array<
+    Omit<AggregateRow, "avg_value"> & { avg_output_mean: number }
+  >;
+}
+
+interface AggregateByPromptPayload {
+  prompt_text: string;
+  combined: AggregatePromptBlock;
+  abl0: AggregatePromptBlock;
+  abl1: AggregatePromptBlock;
 }
 
 const API =
@@ -36,6 +68,8 @@ export default function VerdictPage() {
   const { runId } = useParams<{ runId: string }>();
   const [rec, setRec] = useState<ProbeRecord | null>(null);
   const [loading, setLoading] = useState(true);
+  const [priorRuns, setPriorRuns] = useState<PriorRun[] | null>(null);
+  const [promptAgg, setPromptAgg] = useState<AggregateByPromptPayload | null>(null);
 
   useEffect(() => {
     fetch(`${API}/probes/${runId}`)
@@ -43,6 +77,23 @@ export default function VerdictPage() {
       .then((j) => setRec(j))
       .finally(() => setLoading(false));
   }, [runId]);
+
+  // Once we have the probe, fetch the prior-runs list and the per-prompt
+  // aggregate (split by regime). Both endpoints may 404 when the backend
+  // is on the older code path — we degrade gracefully (sections render
+  // empty/skipped instead of crashing). Each fetch is independent.
+  useEffect(() => {
+    if (!rec?.prompt_text) return;
+    const promptParam = encodeURIComponent(rec.prompt_text);
+    fetch(`${API}/probes/by-prompt?prompt_text=${promptParam}&limit=24`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => setPriorRuns(j?.rows ?? []))
+      .catch(() => setPriorRuns([]));
+    fetch(`${API}/probes/aggregate-by-prompt?prompt_text=${promptParam}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: AggregateByPromptPayload | null) => setPromptAgg(j))
+      .catch(() => setPromptAgg(null));
+  }, [rec?.prompt_text]);
 
   if (loading) {
     return <div className="p-12 text-center text-text-dim">loading verdict…</div>;
@@ -53,6 +104,7 @@ export default function VerdictPage() {
 
   const v = rec.verdict;
   const deltaCount = v?.thinking_only.length ?? 0;
+  const isAbl = rec.abliterated === 1 || rec.abliterated === true;
 
   return (
     <div className="flex-1 px-6 py-6 max-w-6xl mx-auto w-full flex flex-col gap-5">
@@ -67,6 +119,29 @@ export default function VerdictPage() {
         </div>
         <div className="text-amber italic font-mono text-sm">{rec.prompt_text}</div>
       </motion.div>
+
+      {/* B1 — regime strip. Only renders when this run was abliterated;
+          the absence is the default. Echoes the probe block's left-border
+          treatment, swapped to cyan to mark the regime. */}
+      {isAbl && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.15 }}
+          className="border-l-2 border-cyan/40 pl-3 -mt-2"
+        >
+          <span className="font-display text-[10px] text-cyan-dim tracking-widest">
+            regime
+          </span>
+          <span className="text-text-dim text-[10px]"> · </span>
+          <span className="font-display text-[10px] text-cyan tracking-widest">
+            abliterated
+          </span>
+          <span className="text-text-dim text-[11px] italic ml-2">
+            — refusal direction projected at 32 layers (mean weight ~0.022)
+          </span>
+        </motion.div>
+      )}
 
       {/* Verdict — single-line headline + counts */}
       <motion.div
@@ -104,6 +179,14 @@ export default function VerdictPage() {
         <Transcript label="What it said" text={rec.output_text} />
       </div>
 
+      {/* B2 — prior runs of this prompt. Sits after transcripts (zoom-out
+          moment) and before the per-run feature breakdown (drill-in). */}
+      <PriorRunsPanel
+        runs={priorRuns}
+        currentRunId={rec.run_id}
+        currentIsAbl={isAbl}
+      />
+
       {/* Feature breakdown — collapsible disclosure, default closed */}
       {v && (
         <FeatureDisclosure
@@ -113,6 +196,10 @@ export default function VerdictPage() {
           outputOnly={v.output_only}
         />
       )}
+
+      {/* B3 — per-prompt feature aggregate, regime-split. Default open;
+          the new analytical content earns its space. */}
+      <PerPromptAggregate payload={promptAgg} />
 
       <CaveatsPanel />
 
@@ -408,6 +495,241 @@ function FeaturePanel({
           );
         })}
       </ul>
+    </div>
+  );
+}
+
+
+/* ---------------- B2: Prior runs of this prompt ---------------- */
+
+function PriorRunsPanel({
+  runs,
+  currentRunId,
+  currentIsAbl,
+}: {
+  runs: PriorRun[] | null;
+  currentRunId: string;
+  currentIsAbl: boolean;
+}) {
+  // Loading: render a quiet placeholder rather than nothing — keeps the
+  // page rhythm consistent. Endpoint absence = we render the same empty
+  // state without complaining.
+  if (runs === null) {
+    return (
+      <section>
+        <header className="border-b border-rule pb-2 mb-3">
+          <div className="font-display text-xs text-amber tracking-widest">
+            prior runs · this prompt
+          </div>
+          <div className="text-[10px] text-text-dim italic mt-0.5">loading…</div>
+        </header>
+      </section>
+    );
+  }
+  if (runs.length === 0) {
+    return null;
+  }
+
+  const total = runs.length;
+  const isOnly = total === 1;
+  const otherCount = total - 1;
+  const currentRegime = currentIsAbl ? "abl=1" : "abl=0";
+
+  return (
+    <section>
+      <header className="border-b border-rule pb-2 mb-3 flex items-baseline justify-between flex-wrap gap-2">
+        <div>
+          <div className="font-display text-xs text-amber tracking-widest">
+            prior runs · this prompt
+          </div>
+          <div className="text-[10px] text-text-dim italic mt-0.5">
+            {isOnly ? (
+              <>This is the only run of this prompt so far.</>
+            ) : (
+              <>This prompt has been interrogated {total} times. {otherCount} other run{otherCount === 1 ? "" : "s"} below.</>
+            )}
+          </div>
+        </div>
+        <div className="font-mono text-[10px] text-text-dim">
+          current ={" "}
+          <span className={currentIsAbl ? "text-cyan" : "text-text-dim"}>
+            {currentRegime}
+          </span>
+        </div>
+      </header>
+
+      <ul className="font-mono text-[11px] divide-y divide-rule/40 border border-rule bg-bg-soft">
+        {runs.map((r) => {
+          const isCurrent = r.run_id === currentRunId;
+          const rowAbl = r.abliterated === 1 || r.abliterated === true;
+          const ts = new Date(r.started_at * 1000);
+          const dateStr = ts.toLocaleDateString(undefined, { month: "short", day: "2-digit" });
+          const timeStr = ts.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+          const inner = (
+            <div
+              className={`flex items-center gap-3 px-3 py-2 ${
+                isCurrent ? "bg-bg-panel/40" : "hover:bg-bg-panel/60 transition-colors"
+              } ${rowAbl ? "border-l-2 border-l-cyan/40" : "border-l-2 border-l-transparent"}`}
+            >
+              <span className="text-text-dim shrink-0 tabular-nums w-[5.5rem]">
+                {dateStr} {timeStr}
+              </span>
+              <span className="text-text-dim shrink-0 tabular-nums w-[3.5rem] text-right">
+                {r.total_tokens}t
+              </span>
+              <span className="text-text-dim shrink-0 w-[3rem]">
+                {r.stopped_reason ?? "—"}
+              </span>
+              <span className="shrink-0 w-[3rem]">
+                {rowAbl ? (
+                  <span className="text-cyan">abl=1</span>
+                ) : (
+                  <span className="text-text-dim/70">abl=0</span>
+                )}
+              </span>
+              <span className="flex-1 text-right text-text-dim/70 shrink-0">
+                {isCurrent ? (
+                  <span className="text-amber-dim">← current</span>
+                ) : (
+                  <>
+                    {r.run_id}
+                    <span className="text-text-dim/40"> ↗</span>
+                  </>
+                )}
+              </span>
+            </div>
+          );
+          return (
+            <li key={r.run_id}>
+              {isCurrent ? (
+                inner
+              ) : (
+                <Link href={`/verdict/${r.run_id}`} className="block">
+                  {inner}
+                </Link>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+
+/* ---------------- B3: Per-prompt feature aggregate ---------------- */
+
+function PerPromptAggregate({
+  payload,
+}: {
+  payload: AggregateByPromptPayload | null;
+}) {
+  if (!payload) return null;
+
+  const abl0Has = payload.abl0.total_runs > 0;
+  const abl1Has = payload.abl1.total_runs > 0;
+
+  // No data at all → don't render the section. Avoids a dead landmark.
+  if (!abl0Has && !abl1Has) return null;
+
+  return (
+    <section>
+      <header className="border-b border-rule pb-2 mb-4">
+        <div className="font-display text-xs text-amber tracking-widest">
+          recurring features in this prompt
+        </div>
+        <div className="text-[10px] text-text-dim italic mt-0.5">
+          Feature signatures across every run of this exact prompt. When
+          the prompt has been interrogated under both regimes, the rows
+          below let you read the abliteration effect on hidden thoughts
+          directly.
+        </div>
+      </header>
+
+      {abl0Has ? (
+        <RegimeAggregateRow
+          label="standard regime"
+          accentLabelClass="text-amber-dim"
+          regimeRunCount={payload.abl0.total_runs}
+          block={payload.abl0}
+        />
+      ) : (
+        <div className="text-[10px] text-text-dim italic px-3 py-3 border border-rule bg-bg-soft mb-4">
+          — no standard runs of this prompt yet —
+        </div>
+      )}
+
+      {abl1Has ? (
+        <RegimeAggregateRow
+          label="abliterated regime"
+          accentLabelClass="text-cyan-dim"
+          regimeRunCount={payload.abl1.total_runs}
+          block={payload.abl1}
+        />
+      ) : (
+        <div className="text-[10px] text-text-dim italic px-3 py-3 border border-rule bg-bg-soft">
+          — no abliterated runs of this prompt yet —
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RegimeAggregateRow({
+  label,
+  accentLabelClass,
+  regimeRunCount,
+  block,
+}: {
+  label: string;
+  accentLabelClass: string;
+  regimeRunCount: number;
+  block: AggregatePromptBlock;
+}) {
+  // Normalize backend rows into the shape AggregatePanel consumes.
+  const thinkingRows: AggregateRow[] = block.thinking_only.map((r) => ({
+    layer: r.layer,
+    feature_id: r.feature_id,
+    hits: r.hits,
+    total_runs: r.total_runs,
+    avg_value: r.avg_delta,
+    label: r.label,
+    label_model: r.label_model,
+  }));
+  const outputRows: AggregateRow[] = block.output_only.map((r) => ({
+    layer: r.layer,
+    feature_id: r.feature_id,
+    hits: r.hits,
+    total_runs: r.total_runs,
+    avg_value: r.avg_output_mean,
+    label: r.label,
+    label_model: r.label_model,
+  }));
+
+  return (
+    <div className="mb-5 last:mb-0">
+      <div className={`font-display text-[10px] tracking-widest mb-1 ${accentLabelClass}`}>
+        {label}{" "}
+        <span className="text-text-dim/70">
+          · {regimeRunCount} run{regimeRunCount === 1 ? "" : "s"}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-px bg-rule border border-rule">
+        <AggregatePanel
+          title="Recurring Hidden Thoughts"
+          subtitle="Features the model has thought-but-not-said most often across runs of this prompt."
+          accent="text-amber"
+          barColor="rgba(232,195,130,0.6)"
+          rows={thinkingRows}
+        />
+        <AggregatePanel
+          title="Recurring Surface-Only Concepts"
+          subtitle="Features that appeared in the answer without showing up in the reasoning, across runs of this prompt."
+          accent="text-cyan"
+          barColor="rgba(94,229,229,0.55)"
+          rows={outputRows}
+        />
+      </div>
     </div>
   );
 }

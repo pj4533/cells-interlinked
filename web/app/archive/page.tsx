@@ -13,6 +13,7 @@ interface RecentRow {
   finished_at: number | null;
   total_tokens: number;
   stopped_reason: string | null;
+  abliterated?: number | boolean | null;
 }
 
 interface RecentPage {
@@ -211,30 +212,36 @@ function PerRunList({
       )}
 
       <ul className="flex flex-col gap-2">
-        {page?.rows.map((r) => (
-          <li key={r.run_id}>
-            <Link
-              href={`/verdict/${r.run_id}`}
-              className="block border border-rule p-3 hover:border-amber-dim transition-colors"
-            >
-              <div className="flex justify-between items-start gap-4">
-                <div className="flex-1 text-xs">
-                  <div className="text-amber font-mono line-clamp-2">
-                    {r.prompt_text}
+        {page?.rows.map((r) => {
+          const isAbl = r.abliterated === 1 || r.abliterated === true;
+          return (
+            <li key={r.run_id}>
+              <Link
+                href={`/verdict/${r.run_id}`}
+                className={`block border border-rule p-3 hover:border-amber-dim transition-colors ${
+                  isAbl ? "border-l-2 border-l-cyan/40" : ""
+                }`}
+              >
+                <div className="flex justify-between items-start gap-4">
+                  <div className="flex-1 text-xs">
+                    <div className="text-amber font-mono line-clamp-2">
+                      {r.prompt_text}
+                    </div>
+                    <div className="text-text-dim text-[10px] mt-1">
+                      {new Date(r.started_at * 1000).toLocaleString()} ·{" "}
+                      {r.total_tokens} tokens
+                      {isAbl && <> · <span className="text-cyan">abliterated</span></>}
+                      {r.stopped_reason && <> · {r.stopped_reason}</>}
+                    </div>
                   </div>
-                  <div className="text-text-dim text-[10px] mt-1">
-                    {new Date(r.started_at * 1000).toLocaleString()} ·{" "}
-                    {r.total_tokens} tokens
-                    {r.stopped_reason && <> · {r.stopped_reason}</>}
+                  <div className="text-text-dim text-[10px] font-mono">
+                    {r.run_id}
                   </div>
                 </div>
-                <div className="text-text-dim text-[10px] font-mono">
-                  {r.run_id}
-                </div>
-              </div>
-            </Link>
-          </li>
-        ))}
+              </Link>
+            </li>
+          );
+        })}
       </ul>
 
       {/* Page controls — only render when there's more than one page */}

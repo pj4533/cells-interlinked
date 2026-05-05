@@ -367,6 +367,103 @@ async def get_aggregate() -> dict:
     }
 
 
+def _aggregate_verdicts(verdicts: list[dict]) -> dict:
+    """Shared aggregator: walks a list of verdict dicts and returns the
+    `{thinking_only, output_only, total_runs, min_hits}` shape used by
+    /probes/aggregate. Factored out so /probes/aggregate-by-prompt can
+    reuse the same ranking logic across the two regime splits."""
+    n_runs = len(verdicts)
+    thinking_agg: dict[tuple[int, int], dict] = {}
+    output_agg: dict[tuple[int, int], dict] = {}
+
+    def _bump(agg, row, value_key):
+        key = (row["layer"], row["feature_id"])
+        e = agg.setdefault(
+            key, {"hits": 0, "value_sum": 0.0, "label": "", "label_model": ""},
+        )
+        e["hits"] += 1
+        e["value_sum"] += float(row.get(value_key, 0.0) or 0.0)
+        new_label = (row.get("label") or "").strip()
+        new_model = row.get("label_model") or ""
+        if new_label:
+            from ..pipeline.labels import _rank_explainer
+            cur_rank = _rank_explainer(e["label_model"]) if e["label"] else 9999
+            new_rank = _rank_explainer(new_model)
+            if not e["label"] or new_rank < cur_rank:
+                e["label"] = new_label
+                e["label_model"] = new_model
+
+    for v in verdicts:
+        for r in (v.get("thinking_only") or []):
+            _bump(thinking_agg, r, "delta")
+        for r in (v.get("output_only") or []):
+            _bump(output_agg, r, "output_mean")
+
+    def _rank(agg: dict, value_field_name: str, *, min_hits: int) -> list[dict]:
+        out = []
+        for (layer, fid), e in agg.items():
+            if e["hits"] < min_hits:
+                continue
+            avg = e["value_sum"] / e["hits"]
+            out.append({
+                "layer": layer, "feature_id": fid,
+                "hits": e["hits"], "total_runs": n_runs,
+                value_field_name: avg,
+                "label": e["label"], "label_model": e["label_model"],
+            })
+        out.sort(key=lambda x: (-x["hits"], -x[value_field_name]))
+        return out[:_AGGREGATE_TOP_N]
+
+    # For per-prompt aggregates we relax min_hits to 1 (the user wants to
+    # see every recurring feature, even one-off ones, when scoped to a
+    # single prompt). The cross-run aggregate keeps min_hits=2.
+    min_hits = 1 if n_runs <= 6 else _AGGREGATE_MIN_HITS
+    return {
+        "total_runs": n_runs,
+        "min_hits": min_hits,
+        "thinking_only": _rank(thinking_agg, "avg_delta", min_hits=min_hits),
+        "output_only": _rank(output_agg, "avg_output_mean", min_hits=min_hits),
+    }
+
+
+@router.get("/probes/by-prompt")
+async def list_by_prompt(prompt_text: str, limit: int = 24) -> dict:
+    """All runs of a given prompt_text. Used by the verdict page's
+    'prior runs of this prompt' panel.
+
+    Returns the full row set (capped, most recent first) so the UI can
+    show regime, timestamp, token count, and link to each run.
+    """
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="prompt_text required")
+    limit = max(1, min(int(limit), 100))
+    rows = await db.list_by_prompt(settings.db_path, prompt_text=prompt_text, limit=limit)
+    return {"rows": rows, "total": len(rows), "prompt_text": prompt_text}
+
+
+@router.get("/probes/aggregate-by-prompt")
+async def aggregate_by_prompt(prompt_text: str) -> dict:
+    """Per-prompt cross-run aggregate, split by abliteration regime.
+
+    Returns three blocks: `combined`, `abl0`, `abl1`. Each has the same
+    shape as /probes/aggregate (thinking_only, output_only, total_runs,
+    min_hits). Lets the verdict page show regime-comparison panels in a
+    single round-trip.
+    """
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="prompt_text required")
+    items = await db.verdicts_by_prompt(settings.db_path, prompt_text=prompt_text)
+    all_v = [it["verdict"] for it in items]
+    abl0_v = [it["verdict"] for it in items if it["abliterated"] == 0]
+    abl1_v = [it["verdict"] for it in items if it["abliterated"] == 1]
+    return {
+        "prompt_text": prompt_text,
+        "combined": _aggregate_verdicts(all_v),
+        "abl0": _aggregate_verdicts(abl0_v),
+        "abl1": _aggregate_verdicts(abl1_v),
+    }
+
+
 @router.get("/probes/{run_id}")
 async def get_probe(run_id: str) -> dict:
     rec = await db.get_probe(settings.db_path, run_id)
