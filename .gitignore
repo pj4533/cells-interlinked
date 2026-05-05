@@ -70,6 +70,7 @@ saes/
 .vscode/
 .idea/
 *.iml
+.claude/
 
 # Logs
 *.log
