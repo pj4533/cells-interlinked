@@ -202,9 +202,26 @@ def _make_ablation_hook(
     layer_idx: int,
     weight: float,
 ):
-    """Forward hook that projects out the refusal direction at one layer."""
+    """Forward hook that projects out the refusal direction at one layer.
+
+    Caller is responsible for ensuring `refusal_dirs` is already on the
+    correct device + dtype. We close over a single-row view to avoid any
+    per-call .to() (which empirically deadlocks the MPS allocator on the
+    first abliterated probe — pre-moving once at app startup is the fix)."""
+    direction = refusal_dirs[layer_idx]
+    fired = [False]  # one-shot, mutable from inner scope
 
     def hook(_module, _input, output):
+        # Log first fire of layer 0 only — confirms the hook chain is wired
+        # without spamming 32 lines per probe.
+        if not fired[0] and layer_idx == 0:
+            import logging as _l
+            _l.getLogger("cells_interlinked.pipeline.abliteration").info(
+                "ablation hooks live (layer 0 fired; dir on %s/%s w=%.5f)",
+                direction.device, direction.dtype, weight,
+            )
+            fired[0] = True
+
         if isinstance(output, tuple):
             hidden_states = output[0]
             rest = output[1:]
@@ -212,12 +229,21 @@ def _make_ablation_hook(
             hidden_states = output
             rest = None
 
-        direction = refusal_dirs[layer_idx].to(
-            device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        # If caller forgot to pre-align, fall back to .to() but log loudly.
+        if direction.device != hidden_states.device or direction.dtype != hidden_states.dtype:
+            import logging as _l
+            _l.getLogger("cells_interlinked.pipeline.abliteration").warning(
+                "ablation hook layer=%d: direction not pre-aligned (%s/%s vs %s/%s)",
+                layer_idx, direction.device, direction.dtype,
+                hidden_states.device, hidden_states.dtype,
+            )
+            d = direction.to(device=hidden_states.device, dtype=hidden_states.dtype)
+        else:
+            d = direction
+
         # h' = h - weight * (h · r_hat) * r_hat
-        dot = (hidden_states * direction).sum(dim=-1, keepdim=True)
-        proj = dot * direction
+        dot = (hidden_states * d).sum(dim=-1, keepdim=True)
+        proj = dot * d
         ablated = hidden_states - weight * proj
 
         if rest is not None:

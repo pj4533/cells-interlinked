@@ -72,10 +72,16 @@ async def lifespan(app: FastAPI):
                 )
                 app.state.refusal_directions = None
             else:
+                # Pre-move directions to model device + dtype ONCE at startup.
+                # Without this, the per-layer hook does .to(device, dtype) on
+                # every forward step, triggering CPU→MPS allocator churn that
+                # has empirically deadlocked the first abliterated probe.
+                directions = directions.to(device=bundle.device, dtype=bundle.dtype).contiguous()
                 app.state.refusal_directions = directions
                 logger.info(
-                    "loaded refusal directions: %s (norm range %.3f-%.3f)",
+                    "loaded refusal directions: %s on %s/%s (norm range %.3f-%.3f)",
                     tuple(directions.shape),
+                    directions.device, directions.dtype,
                     float(directions.norm(dim=-1).min()),
                     float(directions.norm(dim=-1).max()),
                 )

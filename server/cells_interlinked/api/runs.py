@@ -10,7 +10,12 @@ from dataclasses import dataclass, field
 class RunState:
     run_id: str
     prompt_text: str
-    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=10000))
+    # Unbounded queue. The SSE handler drains this when a client connects;
+    # for runs with no client, events accumulate. A bounded queue caused
+    # run_probe to hang on `queue.put` once it filled — abliterated V-K
+    # probes generate ~33 events per token so a 300-token run blew past
+    # any small bound. Memory is ~200B/event × ~50k worst-case ≈ 10MB.
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue())
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
     completed: bool = False

@@ -81,7 +81,15 @@ def _sample_next(
         sorted_logits = torch.where(keep_mask, sorted_logits, torch.full_like(sorted_logits, -1e30))
         z = torch.full_like(z, -1e30).scatter_(-1, sorted_idx, sorted_logits)
     probs = F.softmax(z, dim=-1)
-    return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+    # Run multinomial on CPU. torch.multinomial on MPS hangs on certain
+    # probability distributions produced by abliterated logits + the
+    # bypass-prevention mask on V-K probes — confirmed by switching to
+    # temperature=0 (which uses argmax) making the same prompts succeed.
+    # The probs vector is just `vocab_size` floats so the CPU round-trip
+    # is cheap. The generator must already be CPU (see run_probe).
+    probs_cpu = probs.detach().to("cpu")
+    sampled = torch.multinomial(probs_cpu, num_samples=1, generator=generator).squeeze(-1)
+    return sampled.to(logits.device)
 
 
 # ---------- Synchronous compute kernels -----------------------------------
@@ -232,7 +240,9 @@ async def run_probe(
 
     generator = None
     if cfg.seed is not None:
-        generator = torch.Generator(device=bundle.device)
+        # CPU generator: multinomial sampling runs on CPU (see _sample_next
+        # for the MPS hang we worked around).
+        generator = torch.Generator(device="cpu")
         generator.manual_seed(cfg.seed)
 
     # Abliteration hooks must be installed BEFORE ResidualHooks so they
@@ -242,9 +252,16 @@ async def run_probe(
     if cfg.abliterate and refusal_directions is not None:
         from .abliteration import install_abliteration_hooks, paper_layer_weights_for_model
         layer_weights = paper_layer_weights_for_model(bundle.num_layers)
+        logger.info(
+            "abliteration: installing hooks (dirs %s on %s/%s, weights[0]=%.5f mid=%.5f last=%.5f)",
+            tuple(refusal_directions.shape),
+            refusal_directions.device, refusal_directions.dtype,
+            layer_weights[0], layer_weights[len(layer_weights)//2], layer_weights[-1],
+        )
         abliteration_handles = install_abliteration_hooks(
             bundle.model, refusal_directions, layer_weights=layer_weights
         )
+        logger.info("abliteration: %d hooks installed", len(abliteration_handles))
 
     hooks = ResidualHooks(bundle.model, saes.layer_indices)
     stopped_reason = "max"
@@ -278,6 +295,8 @@ async def run_probe(
             if cancel_event.is_set():
                 stopped_reason = "cancelled"
                 break
+            if step == 0:
+                logger.info("run_probe: step=0 enter (abl=%s)", bool(cfg.abliterate))
 
             # Bypass-prevention: while we're in the thinking phase and have
             # emitted fewer than MIN_THINKING_TOKENS thinking tokens, mask
