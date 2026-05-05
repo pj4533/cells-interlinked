@@ -26,6 +26,7 @@ class ProbeRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     seed: int | None = None
+    abliterate: bool = False
 
 
 class ProbeResponse(BaseModel):
@@ -51,6 +52,7 @@ async def kickoff_probe(
     top_p: float | None = None,
     seed: int | None = None,
     source: str = "manual",
+    abliterate: bool = False,
 ) -> "RunState":
     """Begin a probe run. Returns the registered RunState immediately;
     the actual generation happens in a background task on `state.task`.
@@ -75,11 +77,24 @@ async def kickoff_probe(
     if seed is None:
         seed = _seed_from_run_id(run_id)
 
+    # Refusal-direction abliteration is only available if directions were
+    # loaded at startup; reject the request loudly otherwise so the caller
+    # knows the toggle didn't actually do anything.
+    if abliterate and getattr(app.state, "refusal_directions", None) is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "abliterate=true but no refusal_directions loaded. "
+                "Run scripts/compute_refusal_direction.py and restart the backend."
+            ),
+        )
+
     cfg = ProbeConfig(
         temperature=temperature if temperature is not None else settings.temperature,
         top_p=top_p if top_p is not None else settings.top_p,
         top_k_stream=settings.stream_top_k,
         seed=seed,
+        abliterate=abliterate,
     )
 
     state = RunState(run_id=run_id, prompt_text=prompt_text)
@@ -96,6 +111,7 @@ async def kickoff_probe(
         config_json=asdict(cfg),
         source=source,
         seed=seed,
+        abliterated=cfg.abliterate,
     )
 
     state.task = asyncio.create_task(
@@ -113,6 +129,7 @@ async def start_probe(req: ProbeRequest, request: Request) -> ProbeResponse:
         top_p=req.top_p,
         seed=req.seed,
         source="manual",
+        abliterate=req.abliterate,
     )
     return ProbeResponse(run_id=state.run_id)
 
@@ -151,6 +168,7 @@ async def _execute_probe(app, state: RunState, cfg: ProbeConfig, started_at: flo
                 cfg=cfg,
                 cancel_event=state.cancel_event,
                 queue=inner_queue,
+                refusal_directions=getattr(app.state, "refusal_directions", None),
             )
     except Exception as exc:
         await state.queue.put({"type": "error", "message": str(exc)})

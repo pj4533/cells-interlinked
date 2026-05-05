@@ -34,6 +34,7 @@ interface AutorunStatus {
   running: boolean;
   stop_requested: boolean;
   current_run_id: string | null;
+  abliterate: boolean;
   recent_log: Array<{
     ts: number;
     kind: string;
@@ -62,6 +63,7 @@ interface AutorunStatus {
   };
   config: {
     interval_sec: number;
+    abliteration_available: boolean;
   };
 }
 
@@ -74,6 +76,7 @@ interface RecentRow {
   stopped_reason: string | null;
   source: string;
   seed: number | null;
+  abliterated: number | boolean | null;
 }
 
 export default function AutorunPage() {
@@ -127,6 +130,25 @@ export default function AutorunPage() {
     }
   };
 
+  const onAbliterateToggle = async (enabled: boolean) => {
+    if (!status || busy) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API}/autorun/abliterate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        setPollError(`abliterate toggle failed: ${detail}`);
+      }
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (!status) {
     return (
       <div className="flex-1 px-6 py-8 max-w-6xl mx-auto w-full">
@@ -170,7 +192,7 @@ export default function AutorunPage() {
       </section>
 
       {/* ===== Toggle + queue progress ===== */}
-      <section className="mb-8 grid grid-cols-1 md:grid-cols-[auto_1fr] gap-6 items-center">
+      <section className="mb-4 grid grid-cols-1 md:grid-cols-[auto_1fr] gap-6 items-center">
         <button
           data-vk
           type="button"
@@ -196,6 +218,16 @@ export default function AutorunPage() {
           minRuns={status.queue.min_runs_per_probe}
           maxRuns={status.queue.max_runs_per_probe}
           totalRuns={status.queue.total_runs}
+        />
+      </section>
+
+      {/* ===== Abliteration toggle ===== */}
+      <section className="mb-8">
+        <AbliterationToggle
+          enabled={status.abliterate}
+          available={status.config.abliteration_available}
+          busy={busy}
+          onChange={onAbliterateToggle}
         />
       </section>
 
@@ -257,6 +289,83 @@ function StatusStrip({
         <div>
           <div className="text-text-dim/70">INTERVAL</div>
           <div className="text-amber">{intervalSec.toFixed(0)}s</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AbliterationToggle({
+  enabled,
+  available,
+  busy,
+  onChange,
+}: {
+  enabled: boolean;
+  available: boolean;
+  busy: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  const disabled = !available || busy;
+  return (
+    <div
+      className="border border-rule bg-bg-soft px-5 py-4 flex items-center gap-5"
+      style={
+        enabled
+          ? {
+              borderColor: "var(--cyan-dim)",
+              boxShadow: "0 0 18px rgba(94, 229, 229, 0.18)",
+            }
+          : undefined
+      }
+    >
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        disabled={disabled}
+        onClick={() => onChange(!enabled)}
+        className="relative inline-flex h-6 w-12 shrink-0 items-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        style={{
+          background: enabled ? "var(--cyan-dim)" : "var(--bg)",
+          border: "1px solid var(--rule)",
+        }}
+      >
+        <span
+          className="block h-4 w-4 transition-transform"
+          style={{
+            background: enabled ? "var(--cyan)" : "var(--text-dim)",
+            transform: enabled ? "translateX(28px)" : "translateX(4px)",
+          }}
+        />
+      </button>
+      <div className="flex-1">
+        <div
+          className={`font-display text-sm tracking-widest ${
+            enabled ? "text-cyan cyan-glow" : "text-text-dim"
+          }`}
+        >
+          ABLITERATE REFUSAL DIRECTION
+        </div>
+        <div className="text-[10px] text-text-dim italic mt-0.5 leading-snug">
+          {!available ? (
+            <>
+              No <code>refusal_directions.pt</code> loaded. Run{" "}
+              <code>scripts/compute_refusal_direction.py</code> and restart the
+              backend to enable.
+            </>
+          ) : enabled ? (
+            <>
+              On — every new probe runs with the per-layer refusal direction
+              projected out (Macar 2026 weights). The SAE captures
+              post-abliteration residuals.
+            </>
+          ) : (
+            <>
+              Off — probes run normally. Toggle takes effect on the next probe;
+              the in-flight probe (if any) finishes under its current setting.
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -455,6 +564,9 @@ function RecentRuns({ rows }: { rows: RecentRow[] }) {
                       {r.total_tokens} tokens
                       {r.seed !== null && (
                         <> · seed {r.seed}</>
+                      )}
+                      {(r.abliterated === 1 || r.abliterated === true) && (
+                        <> · <span className="text-cyan">abliterated</span></>
                       )}
                       {r.stopped_reason && <> · {r.stopped_reason}</>}
                     </div>

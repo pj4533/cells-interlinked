@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS probes (
   verdict_json    TEXT,
   config_json     TEXT,
   source          TEXT NOT NULL DEFAULT 'manual',
-  seed            INTEGER
+  seed            INTEGER,
+  abliterated     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_probes_started ON probes (started_at DESC);
@@ -85,6 +86,10 @@ async def init_db(path: Path) -> None:
         await cur.close()
         if "seed" not in cols:
             await db.execute("ALTER TABLE probes ADD COLUMN seed INTEGER")
+        if "abliterated" not in cols:
+            await db.execute(
+                "ALTER TABLE probes ADD COLUMN abliterated INTEGER NOT NULL DEFAULT 0"
+            )
         # Drop the legacy generated_probes table and proposer_run_id
         # column from the proposer architecture, which is gone.
         await db.execute("DROP TABLE IF EXISTS generated_probes")
@@ -149,13 +154,14 @@ async def insert_probe_start(
     config_json: dict[str, Any],
     source: str = "manual",
     seed: int | None = None,
+    abliterated: bool = False,
 ) -> None:
     async with aiosqlite.connect(path) as db:
         await db.execute(
             "INSERT INTO probes "
             "(run_id, prompt_text, rendered_prompt, started_at, config_json, "
-            " source, seed) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " source, seed, abliterated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 prompt_text,
@@ -164,6 +170,7 @@ async def insert_probe_start(
                 json.dumps(config_json),
                 source,
                 seed,
+                1 if abliterated else 0,
             ),
         )
         await db.commit()

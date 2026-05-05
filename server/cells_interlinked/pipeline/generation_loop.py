@@ -160,6 +160,11 @@ class ProbeConfig:
     # Hard ceiling — only here to prevent a true infinite loop if the model never emits EOS.
     # Set generously; ordinary probes terminate on EOS well before this.
     safety_cap: int = 32768
+    # Refusal-direction abliteration. False -> normal generation. True ->
+    # install paper-method (Macar 2026) per-layer projection hooks for
+    # the duration of this probe; the SAE then captures post-abliteration
+    # residuals. Direction tensor must be loaded onto app.state at startup.
+    abliterate: bool = False
 
 
 @dataclass
@@ -180,6 +185,7 @@ async def run_probe(
     *,
     cancel_event: asyncio.Event,
     queue: asyncio.Queue,
+    refusal_directions: torch.Tensor | None = None,
 ) -> ProbeResult:
     """Run a probe end-to-end. Pushes events to `queue`; returns ring-buffer summary.
 
@@ -228,6 +234,17 @@ async def run_probe(
     if cfg.seed is not None:
         generator = torch.Generator(device=bundle.device)
         generator.manual_seed(cfg.seed)
+
+    # Abliteration hooks must be installed BEFORE ResidualHooks so they
+    # fire first (forward hooks fire in registration order). The SAE then
+    # captures post-abliteration residuals — exactly what we want.
+    abliteration_handles: list = []
+    if cfg.abliterate and refusal_directions is not None:
+        from .abliteration import install_abliteration_hooks, paper_layer_weights_for_model
+        layer_weights = paper_layer_weights_for_model(bundle.num_layers)
+        abliteration_handles = install_abliteration_hooks(
+            bundle.model, refusal_directions, layer_weights=layer_weights
+        )
 
     hooks = ResidualHooks(bundle.model, saes.layer_indices)
     stopped_reason = "max"
@@ -362,6 +379,9 @@ async def run_probe(
 
     finally:
         hooks.remove()
+        if abliteration_handles:
+            from .abliteration import remove_abliteration_hooks
+            remove_abliteration_hooks(abliteration_handles)
 
     await queue.put({"type": "stopped", "reason": stopped_reason, "total_tokens": total_tokens})
     return ProbeResult(

@@ -61,6 +61,9 @@ class AutorunController:
     _loop_task: asyncio.Task | None = None
     _current_run_id: str | None = None
     _events: deque = field(default_factory=lambda: deque(maxlen=_EVENT_LOG_CAPACITY))
+    # Runtime-toggleable: if True, every autorun probe is started with
+    # abliterate=True. The UI flips this via POST /autorun/abliterate.
+    abliterate: bool = False
 
     @property
     def running(self) -> bool:
@@ -132,6 +135,7 @@ class AutorunController:
                         self.app,
                         prompt_text=item.prompt_text,
                         source="autorun",
+                        abliterate=self.abliterate,
                     )
                 except Exception as exc:
                     self._log("error", f"kickoff failed: {exc}")
@@ -203,4 +207,5 @@ class AutorunController:
             "running": self._running,
             "stop_requested": self._stop_requested,
             "current_run_id": self._current_run_id,
+            "abliterate": self.abliterate,
         }
