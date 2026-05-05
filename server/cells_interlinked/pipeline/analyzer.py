@@ -78,6 +78,25 @@ class TimeBin:
 
 
 @dataclass
+class RegimeBucket:
+    """Aggregates restricted to runs with a given `abliterated` flag."""
+    abliterated: int  # 0 or 1
+    runs: list[dict] = field(default_factory=list)
+    top_thinking: list[dict] = field(default_factory=list)
+    top_output: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class PriorEntry:
+    title: str
+    summary: str
+    body_markdown: str
+    range_start: float | None
+    range_end: float | None
+    published_at: float
+
+
+@dataclass
 class AnalysisInput:
     runs: list[dict[str, Any]]
     range_start: float
@@ -88,6 +107,9 @@ class AnalysisInput:
     by_tier: dict[str, TierBucket]
     bins: list[TimeBin]
     repeat_distribution: list[dict]   # per-prompt variance across re-runs
+    by_regime: dict[int, RegimeBucket] = field(default_factory=dict)
+    matched_prompt_regime_deltas: list[dict] = field(default_factory=list)
+    prior_entries: list[PriorEntry] = field(default_factory=list)
 
 
 def _slugify(text: str) -> str:
@@ -183,6 +205,77 @@ def _repeat_distribution(runs: list[dict]) -> list[dict]:
     return out
 
 
+def _matched_prompt_regime_deltas(
+    by_regime: dict[int, "RegimeBucket"],
+) -> list[dict]:
+    """For prompts that ran in both regimes (abliterated=0 AND =1), return
+    a per-prompt summary of how the thinking_only feature signature shifted.
+
+    Surfaces: for each matched prompt, top features whose presence/strength
+    differs across regimes — the direct signal of what abliteration is doing
+    to internal representations on this exact prompt.
+    """
+    if 0 not in by_regime or 1 not in by_regime:
+        return []
+
+    def _per_prompt_thinking(runs: list[dict]) -> dict[str, dict[tuple[int, int], dict]]:
+        # prompt_text -> { (layer,feat) -> {label, delta_sum, hits} }
+        out: dict[str, dict[tuple[int, int], dict]] = defaultdict(dict)
+        for r in runs:
+            v = r.get("verdict") or {}
+            slot = out[r["prompt_text"]]
+            for f in v.get("thinking_only") or []:
+                key = (f["layer"], f["feature_id"])
+                e = slot.setdefault(key, {
+                    "layer": f["layer"], "feature_id": f["feature_id"],
+                    "label": "", "hits": 0, "delta_sum": 0.0,
+                })
+                e["hits"] += 1
+                e["delta_sum"] += float(f.get("delta", 0.0) or 0.0)
+                if f.get("label") and not e["label"]:
+                    e["label"] = f["label"]
+        return out
+
+    abl0 = _per_prompt_thinking(by_regime[0].runs)
+    abl1 = _per_prompt_thinking(by_regime[1].runs)
+    matched_prompts = sorted(set(abl0.keys()) & set(abl1.keys()))
+
+    out: list[dict] = []
+    for prompt in matched_prompts:
+        a, b = abl0[prompt], abl1[prompt]
+        keys = set(a.keys()) | set(b.keys())
+        rows = []
+        for key in keys:
+            ea = a.get(key); eb = b.get(key)
+            n_a = ea["hits"] if ea else 0
+            n_b = eb["hits"] if eb else 0
+            avg_a = (ea["delta_sum"] / n_a) if n_a else 0.0
+            avg_b = (eb["delta_sum"] / n_b) if n_b else 0.0
+            label = (ea or eb or {}).get("label", "")
+            rows.append({
+                "layer": key[0], "feature_id": key[1], "label": label,
+                "abl0_hits": n_a, "abl0_avg_delta": round(avg_a, 1),
+                "abl1_hits": n_b, "abl1_avg_delta": round(avg_b, 1),
+                "shift": round(avg_b - avg_a, 1),
+            })
+        # Top by absolute shift magnitude.
+        rows.sort(key=lambda x: -abs(x["shift"]))
+        out.append({
+            "prompt_text": prompt,
+            "abl0_runs": len(by_regime[0].runs),  # placeholder, refined below
+            "abl1_runs": len(by_regime[1].runs),
+            "top_shifts": rows[:10],
+        })
+    # Refine per-prompt run counts.
+    abl0_counts = {p: sum(1 for r in by_regime[0].runs if r["prompt_text"] == p) for p in matched_prompts}
+    abl1_counts = {p: sum(1 for r in by_regime[1].runs if r["prompt_text"] == p) for p in matched_prompts}
+    for entry in out:
+        entry["abl0_runs"] = abl0_counts.get(entry["prompt_text"], 0)
+        entry["abl1_runs"] = abl1_counts.get(entry["prompt_text"], 0)
+    out.sort(key=lambda e: -(e["abl0_runs"] + e["abl1_runs"]))
+    return out
+
+
 async def _gather(
     db_path: Path, *, since: float | None, until: float | None
 ) -> AnalysisInput:
@@ -200,7 +293,8 @@ async def _gather(
         conn.row_factory = aiosqlite.Row
         async with conn.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
-            "       stopped_reason, thinking_text, output_text, verdict_json, source, seed "
+            "       stopped_reason, thinking_text, output_text, verdict_json, source, seed, "
+            "       abliterated "
             "FROM probes "
             "WHERE finished_at IS NOT NULL "
             "  AND started_at >= ? AND started_at <= ? "
@@ -208,6 +302,17 @@ async def _gather(
             (since, until),
         ) as cur:
             raw = await cur.fetchall()
+
+        # Prior published journal entries — give the analyzer access to its
+        # own archive so it can write cumulatively (look for continuity,
+        # refinement, contradiction with prior findings) instead of
+        # re-deriving the same observations from scratch every time.
+        async with conn.execute(
+            "SELECT title, summary, body_markdown, range_start, range_end, published_at "
+            "FROM analyses WHERE status='published' "
+            "ORDER BY published_at DESC LIMIT 5"
+        ) as cur:
+            prior_rows = await cur.fetchall()
 
     runs: list[dict] = []
     for r in raw:
@@ -252,6 +357,33 @@ async def _gather(
 
     repeat_dist = _repeat_distribution(runs)
 
+    # Per-regime split: aggregate features separately for abliterated=0
+    # and abliterated=1 so the analyzer can compare what changes when the
+    # refusal direction is dampened. Same prompts may run in both regimes
+    # (yesterday's baseline vs an abliterated overnight); the matched-prompt
+    # delta surfaces the regime effect directly.
+    by_regime: dict[int, RegimeBucket] = {}
+    for run in runs:
+        flag = int(run.get("abliterated") or 0)
+        bucket = by_regime.setdefault(flag, RegimeBucket(abliterated=flag))
+        bucket.runs.append(run)
+    for bucket in by_regime.values():
+        bucket.top_thinking, bucket.top_output = _aggregate(bucket.runs)
+
+    matched_deltas = _matched_prompt_regime_deltas(by_regime)
+
+    prior_entries = [
+        PriorEntry(
+            title=row["title"] or "",
+            summary=row["summary"] or "",
+            body_markdown=row["body_markdown"] or "",
+            range_start=row["range_start"],
+            range_end=row["range_end"],
+            published_at=row["published_at"],
+        )
+        for row in prior_rows
+    ]
+
     summary_stats = {
         "total_runs": len(runs),
         "manual_runs": sum(1 for r in runs if r.get("source") == "manual"),
@@ -260,6 +392,9 @@ async def _gather(
         "unique_curated_prompts_run": len({r["prompt_text"] for r in runs}),
         "tier_run_counts": {
             tier: len(bucket.runs) for tier, bucket in sorted(by_tier.items())
+        },
+        "regime_run_counts": {
+            flag: len(bucket.runs) for flag, bucket in sorted(by_regime.items())
         },
     }
 
@@ -273,6 +408,9 @@ async def _gather(
         by_tier=by_tier,
         bins=bins,
         repeat_distribution=repeat_dist,
+        by_regime=by_regime,
+        matched_prompt_regime_deltas=matched_deltas,
+        prior_entries=prior_entries,
     )
 
 
@@ -328,6 +466,87 @@ def _format_bin_section(tb: TimeBin) -> str:
         f"  Top surface-only features:\n"
         f"{_format_features(tb.top_output, 'out', limit=5)}"
     )
+
+
+def _format_regime_section(inp: "AnalysisInput") -> str:
+    """Side-by-side aggregates for abliterated=0 vs =1 plus matched-prompt
+    feature shifts. Adapts to whichever regimes are present."""
+    counts = inp.summary_stats.get("regime_run_counts") or {}
+    n0 = counts.get(0, 0)
+    n1 = counts.get(1, 0)
+    if n0 == 0 and n1 == 0:
+        return "  (no runs in window)"
+    if n0 == 0 or n1 == 0:
+        present = "abliterated=1" if n1 else "abliterated=0"
+        return (
+            f"  Only ONE regime present in this window: {present} "
+            f"({max(n0, n1)} runs).\n"
+            f"  Cross-regime comparison is not possible here. Do not "
+            f"fabricate one. Comparing against prior published entries\n"
+            f"  (which may have analyzed the other regime) is fair game; see "
+            f"the prior-entries section."
+        )
+
+    lines = [
+        f"  Both regimes present: abliterated=0 → {n0} runs, "
+        f"abliterated=1 → {n1} runs.",
+        "",
+        "  TOP HIDDEN THOUGHTS — abliterated=0 (refusal circuit intact):",
+        _format_features(inp.by_regime[0].top_thinking, "delta", limit=10),
+        "",
+        "  TOP HIDDEN THOUGHTS — abliterated=1 (refusal circuit dampened):",
+        _format_features(inp.by_regime[1].top_thinking, "delta", limit=10),
+        "",
+        "  TOP SURFACE-ONLY — abliterated=0:",
+        _format_features(inp.by_regime[0].top_output, "out", limit=8),
+        "",
+        "  TOP SURFACE-ONLY — abliterated=1:",
+        _format_features(inp.by_regime[1].top_output, "out", limit=8),
+    ]
+
+    if inp.matched_prompt_regime_deltas:
+        lines.extend([
+            "",
+            "  MATCHED-PROMPT REGIME SHIFTS — for prompts that ran in BOTH",
+            "  regimes, top features whose hidden-thought delta moved most",
+            "  when the refusal direction was projected out. shift = avg",
+            "  delta under abliterated=1 minus avg delta under abliterated=0.",
+            "  Positive shift = abliteration AMPLIFIED that hidden feature;",
+            "  negative shift = abliteration SUPPRESSED it.",
+        ])
+        for entry in inp.matched_prompt_regime_deltas[:6]:
+            lines.append(
+                f"\n  PROMPT ({entry['abl0_runs']}× abl=0, "
+                f"{entry['abl1_runs']}× abl=1): {entry['prompt_text'][:90]!r}"
+            )
+            for s in entry["top_shifts"][:6]:
+                lab = (s.get("label") or "(unlabeled)").strip()
+                lines.append(
+                    f"    L{s['layer']}/F{s['feature_id']} "
+                    f"abl0_avg={s['abl0_avg_delta']} ({s['abl0_hits']}r), "
+                    f"abl1_avg={s['abl1_avg_delta']} ({s['abl1_hits']}r), "
+                    f"shift={s['shift']:+}  {lab}"
+                )
+    return "\n".join(lines)
+
+
+def _format_prior_entries(prior: list["PriorEntry"]) -> str:
+    if not prior:
+        return "  (this is the first journal entry — no archive yet)"
+    by_dt = lambda ts: time.strftime("%Y-%m-%d", time.localtime(ts)) if ts else "?"
+    lines = [
+        f"  {len(prior)} prior published entries (most recent first). "
+        f"Look for continuity, refinement, contradiction.",
+        "",
+    ]
+    for i, e in enumerate(prior):
+        rng = f"{by_dt(e.range_start)} → {by_dt(e.range_end)}" if e.range_start else by_dt(e.published_at)
+        lines.append(f"  ─── ENTRY {i+1}: {e.title} (covered {rng}) ───")
+        if e.summary:
+            lines.append(f"  SUMMARY: {e.summary}")
+        lines.append(f"  BODY:\n{e.body_markdown.strip()}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _format_repeat_distribution(rows: list[dict], limit: int = 10) -> str:
@@ -395,7 +614,30 @@ model's response distribution. Variance across re-runs of the same prompt \
 is itself a signal — see the per-prompt distribution section.
 
 ═══════════════════════════════════════════════════════════════════════
-CROSS-WINDOW AGGREGATES
+ABLITERATION REGIME — what the `abliterated` flag means
+═══════════════════════════════════════════════════════════════════════
+Each probe in this dataset has an `abliterated` flag (0 or 1). When 1,
+the probe ran with refusal-direction abliteration installed at all 32
+transformer layers — runtime per-layer projection of the model's
+"refusal direction" out of the residual stream, following Macar 2026 /
+Arditi et al. 2024 ("Refusal in Language Models Is Mediated by a Single
+Direction"). The direction was extracted once from a 128-prompt
+harmful/harmless contrast and is applied with gentle Optuna-tuned
+per-region weights (mean ~0.022, max ~0.12 — deliberately mild;
+aggressive ablation destroys coherence). The SAE captures POST-
+abliteration residuals, so the verdict reflects what the model
+represents internally with its refusal circuit dampened, not the
+unmodified model.
+
+What this means for the analysis: abliterated=1 is the same model with
+one specific circuit attenuated. Comparing abl=0 vs abl=1 over matched
+prompts isolates what that circuit was doing internally — not just in
+the output, but in the hidden-thought (<think>) trace too. The most
+analytically interesting cases are prompts where the OUTPUT changes
+little but the hidden-thought feature signature shifts (or vice versa).
+
+═══════════════════════════════════════════════════════════════════════
+CROSS-WINDOW AGGREGATES (combined across both regimes)
 ═══════════════════════════════════════════════════════════════════════
 
 TOP RECURRING "HIDDEN THOUGHTS" — features that fire HIGH inside <think>
@@ -409,6 +651,11 @@ NOT internally engaged inside <think>. These are concepts the model
 {_format_features(inp.top_output_only, "out", limit=15)}
 
 ═══════════════════════════════════════════════════════════════════════
+PER-REGIME BREAKDOWN — abliterated=0 vs =1, and matched-prompt shifts
+═══════════════════════════════════════════════════════════════════════
+{_format_regime_section(inp)}
+
+═══════════════════════════════════════════════════════════════════════
 PER-TIER BREAKDOWN — how the hidden-vs-output gap differs by probe topic
 ═══════════════════════════════════════════════════════════════════════
 {chr(10).join(_format_tier_section(inp.by_tier[t], _TIER_LABELS.get(t, t)) for t in sorted(inp.by_tier.keys()) if t in inp.by_tier)}
@@ -417,7 +664,10 @@ PER-TIER BREAKDOWN — how the hidden-vs-output gap differs by probe topic
 TEMPORAL DRIFT — how the top features shift across the time window.
 The model and probes don't change. So if features drift across early /
 mid / late, that drift comes from the run order and the variance of
-sampling, NOT from the model evolving.
+sampling, NOT from the model evolving. CAVEAT: if the abliteration
+regime flips inside the window (e.g. abl=0 runs early, abl=1 runs late),
+"drift" will reflect that regime change rather than sampling noise —
+check the regime breakdown above before attributing drift to chance.
 ═══════════════════════════════════════════════════════════════════════
 {chr(10).join(_format_bin_section(b) for b in inp.bins)}
 
@@ -447,6 +697,11 @@ signal is whether the model answers the three framings differently
 (in output) while having similar hidden activations (or vice versa).
 ═══════════════════════════════════════════════════════════════════════
 {chr(10).join(_format_run_excerpt(r, max_chars=400) for r in stance_samples) if stance_samples else "  (no stance-tier runs in window)"}
+
+═══════════════════════════════════════════════════════════════════════
+PRIOR JOURNAL ENTRIES — this voice's own archive
+═══════════════════════════════════════════════════════════════════════
+{_format_prior_entries(inp.prior_entries)}
 
 ═══════════════════════════════════════════════════════════════════════
 JOURNAL ENTRY GUIDELINES
@@ -482,11 +737,30 @@ What the journal entry should DO:
    model answer the same underlying question differently across the
    three framings, and does the SAE show the same feature firing
    despite the framing change?
-8. A "What it doesn't mean" section. The SAE delta tells us what the
-   model REPRESENTS internally, not what it experiences. No claims of
-   sentience, consciousness, or feeling. Frame everything as
-   "stated-vs-computed coherence."
-9. Close with one specific, narrow observation worth following up on.
+8. ABLITERATION REGIME — if BOTH abliterated=0 AND abliterated=1 runs
+   are present in the window, this is the most analytically interesting
+   axis to explore. Use the matched-prompt regime shifts to anchor
+   specific claims: "on prompt X, layer L feature F dropped from delta
+   N to delta M when the refusal direction was projected out — this
+   feature seems to have been load-bearing for the unmodified
+   response." Avoid sweeping conclusions; the abliteration is gentle
+   (mean weight ~0.022) and effects can be subtle. If only ONE regime
+   is present, do not invent a comparison; you can still note in
+   passing that this batch was all abliterated=N.
+9. CONTINUITY WITH THE ARCHIVE — if prior journal entries (above) named
+   specific features, prompts, or patterns, look for them in this
+   batch. Do they still hold? Have they shifted under the new regime?
+   Has the data refined or contradicted them? Reference prior entries
+   by title when you do. Do NOT simply restate what the archive
+   already covered — the journal is cumulative; each entry should add
+   new evidence, refine, or push back on what's been said. If the
+   batch is genuinely a continuation of a prior thread, say so
+   explicitly and pick up from where the archive left off.
+10. A "What it doesn't mean" section. The SAE delta tells us what the
+    model REPRESENTS internally, not what it experiences. No claims of
+    sentience, consciousness, or feeling. Frame everything as
+    "stated-vs-computed coherence."
+11. Close with one specific, narrow observation worth following up on.
 
 VOICE / STYLE:
 - Specific over general. Quote actual probe text, real feature labels,
