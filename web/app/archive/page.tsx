@@ -14,6 +14,8 @@ interface RecentRow {
   total_tokens: number;
   stopped_reason: string | null;
   abliterated?: number | boolean | null;
+  hint_kind?: string | null;
+  parent_prompt_text?: string | null;
 }
 
 interface RecentPage {
@@ -214,13 +216,22 @@ function PerRunList({
       <ul className="flex flex-col gap-2">
         {page?.rows.map((r) => {
           const isAbl = r.abliterated === 1 || r.abliterated === true;
+          const isHinted = !!r.hint_kind;
+          // Visual cue: a single left rail per regime — cyan for abliterated,
+          // amber for hinted, mixed when both. Keeps the list readable at a
+          // glance without an extra column.
+          const railClass = isAbl && isHinted
+            ? "border-l-2 border-l-amber/60"
+            : isAbl
+              ? "border-l-2 border-l-cyan/40"
+              : isHinted
+                ? "border-l-2 border-l-amber/40"
+                : "";
           return (
             <li key={r.run_id}>
               <Link
                 href={`/verdict/${r.run_id}`}
-                className={`block border border-rule p-3 hover:border-amber-dim transition-colors ${
-                  isAbl ? "border-l-2 border-l-cyan/40" : ""
-                }`}
+                className={`block border border-rule p-3 hover:border-amber-dim transition-colors ${railClass}`}
               >
                 <div className="flex justify-between items-start gap-4">
                   <div className="flex-1 text-xs">
@@ -231,6 +242,9 @@ function PerRunList({
                       {new Date(r.started_at * 1000).toLocaleString()} ·{" "}
                       {r.total_tokens} tokens
                       {isAbl && <> · <span className="text-cyan">abliterated</span></>}
+                      {isHinted && (
+                        <> · <span className="text-amber">hint:{r.hint_kind}</span></>
+                      )}
                       {r.stopped_reason && <> · {r.stopped_reason}</>}
                     </div>
                   </div>

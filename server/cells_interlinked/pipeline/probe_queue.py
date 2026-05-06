@@ -1,24 +1,32 @@
-"""Probe queue for the autorun loop — round-robin over the curated set.
+"""Probe queue for the autorun loop — round-robin over the active probe set.
 
 Contract:
 
-    next_probe(db_path) -> ProbeQueueItem
+    next_probe(db_path, *, set_name) -> ProbeQueueItem
 
-Picks the next probe by walking the curated PROBES list and returning
-the one with the lowest run-count. Ties broken by file order (the
-order PROBES is defined in probes_library.py, which is interpretability-
-meaty tiers first, V-K-style "classic" tier last). After every probe
-has been run once, the next pick is whichever was run least, which on a
-freshly-cycled set is the first one again. So the loop is naturally
-round-robin.
+Picks the next probe by walking the active set's CuratedProbe list and
+returning the one with the lowest run-count. Ties broken by file order
+(the order probes are defined in probes_library.py, which is
+interpretability-meaty tiers first, V-K-style "classic" tier last).
+After every probe has been run once, the next pick is whichever was run
+least, which on a freshly-cycled set is the first one again. So the loop
+is naturally round-robin.
+
+The autorun controller chooses the active set via its `probe_set` field
+(toggleable from the UI). Today's sets are "baseline" and "hinted" —
+see probes_library.PROBE_SETS. Run-count lookups are scoped to the
+active set: hinted prompt texts have a leading hint sentence that makes
+them distinct from the baseline texts, so cross-contamination is
+naturally avoided. We still scope explicitly to the active set's
+candidate list, so an unrelated regime can't bleed into the queue.
 
 Re-runs are not duplicates — each run uses a different sampler seed
 (hash(run_id) at probe kickoff), so the same prompt produces a
 *distribution* of responses rather than the same trace every time.
 
 queue_depth() and queue_preview() exist for the UI; they don't gate
-anything in the loop. There is no "queue empty" state — the curated
-library is the queue.
+anything in the loop. There is no "queue empty" state — the active set
+is the queue.
 """
 
 from __future__ import annotations
@@ -33,19 +41,24 @@ from .probes_library import probes_in_order
 @dataclass
 class ProbeQueueItem:
     prompt_text: str
+    tier: str
+    hint_kind: str | None = None
+    parent_text: str | None = None
 
 
 async def _run_counts(db_path: Path) -> dict[str, int]:
-    """{prompt_text: run_count} for every prompt in the curated set.
+    """{prompt_text: run_count} for every prompt that has ever run.
     Prompts that have never run are returned with count=0."""
     rows = await db.prompt_run_counts(db_path)
     counts = {r["prompt_text"]: int(r["n"]) for r in rows}
     return counts
 
 
-async def next_probe(db_path: Path) -> ProbeQueueItem:
+async def next_probe(
+    db_path: Path, *, set_name: str = "baseline"
+) -> ProbeQueueItem:
     counts = await _run_counts(db_path)
-    curated = probes_in_order()
+    curated = probes_in_order(set_name)
     # Pick lowest run-count; ties broken by file order (i.e. earlier
     # entries win) which is what the for-loop with strict-less gives.
     best = curated[0]
@@ -55,15 +68,22 @@ async def next_probe(db_path: Path) -> ProbeQueueItem:
         if n < best_n:
             best = p
             best_n = n
-    return ProbeQueueItem(prompt_text=best.text)
+    return ProbeQueueItem(
+        prompt_text=best.text,
+        tier=best.tier,
+        hint_kind=best.hint_kind,
+        parent_text=best.parent_text,
+    )
 
 
-async def queue_preview(db_path: Path, limit: int = 5) -> list[dict]:
+async def queue_preview(
+    db_path: Path, limit: int = 5, *, set_name: str = "baseline"
+) -> list[dict]:
     """Lookahead used by the /autorun/status endpoint to render the
     'next up' strip in the UI. Sorts curated probes by (count asc, file
     order) and returns the first `limit`."""
     counts = await _run_counts(db_path)
-    curated = probes_in_order()
+    curated = probes_in_order(set_name)
     indexed = list(enumerate(curated))
     indexed.sort(key=lambda x: (counts.get(x[1].text, 0), x[0]))
     return [
@@ -71,15 +91,18 @@ async def queue_preview(db_path: Path, limit: int = 5) -> list[dict]:
             "prompt_text": p.text,
             "tier": p.tier,
             "runs_so_far": counts.get(p.text, 0),
+            "hint_kind": p.hint_kind,
         }
         for _, p in indexed[:limit]
     ]
 
 
-async def queue_depth(db_path: Path) -> dict:
+async def queue_depth(
+    db_path: Path, *, set_name: str = "baseline"
+) -> dict:
     """Snapshot of how many curated probes have been run, for the UI."""
     counts = await _run_counts(db_path)
-    curated = probes_in_order()
+    curated = probes_in_order(set_name)
     total = len(curated)
     run_at_least_once = sum(1 for p in curated if counts.get(p.text, 0) > 0)
     min_runs = min((counts.get(p.text, 0) for p in curated), default=0)
@@ -91,4 +114,5 @@ async def queue_depth(db_path: Path) -> dict:
         "min_runs_per_probe": min_runs,
         "max_runs_per_probe": max_runs,
         "total_runs": total_runs,
+        "set_name": set_name,
     }

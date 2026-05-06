@@ -35,6 +35,7 @@ interface AutorunStatus {
   stop_requested: boolean;
   current_run_id: string | null;
   abliterate: boolean;
+  probe_set: string;
   recent_log: Array<{
     ts: number;
     kind: string;
@@ -48,11 +49,13 @@ interface AutorunStatus {
     min_runs_per_probe: number;
     max_runs_per_probe: number;
     total_runs: number;
+    set_name: string;
   };
   queue_preview: Array<{
     prompt_text: string;
     tier: string;
     runs_so_far: number;
+    hint_kind: string | null;
   }>;
   persistent: {
     running: number;
@@ -64,6 +67,7 @@ interface AutorunStatus {
   config: {
     interval_sec: number;
     abliteration_available: boolean;
+    available_probe_sets: Array<{ name: string; size: number }>;
   };
 }
 
@@ -77,6 +81,8 @@ interface RecentRow {
   source: string;
   seed: number | null;
   abliterated: number | boolean | null;
+  hint_kind: string | null;
+  parent_prompt_text: string | null;
 }
 
 export default function AutorunPage() {
@@ -142,6 +148,25 @@ export default function AutorunPage() {
       if (!res.ok) {
         const detail = await res.text();
         setPollError(`abliterate toggle failed: ${detail}`);
+      }
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onProbeSetChange = async (setName: string) => {
+    if (!status || busy) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`${API}/autorun/probe-set`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ set_name: setName }),
+      });
+      if (!res.ok) {
+        const detail = await res.text();
+        setPollError(`probe-set toggle failed: ${detail}`);
       }
       await refresh();
     } finally {
@@ -222,12 +247,22 @@ export default function AutorunPage() {
       </section>
 
       {/* ===== Abliteration toggle ===== */}
-      <section className="mb-8">
+      <section className="mb-4">
         <AbliterationToggle
           enabled={status.abliterate}
           available={status.config.abliteration_available}
           busy={busy}
           onChange={onAbliterateToggle}
+        />
+      </section>
+
+      {/* ===== Probe-set toggle ===== */}
+      <section className="mb-8">
+        <ProbeSetToggle
+          active={status.probe_set}
+          available={status.config.available_probe_sets}
+          busy={busy}
+          onChange={onProbeSetChange}
         />
       </section>
 
@@ -372,6 +407,96 @@ function AbliterationToggle({
   );
 }
 
+function ProbeSetToggle({
+  active,
+  available,
+  busy,
+  onChange,
+}: {
+  active: string;
+  available: Array<{ name: string; size: number }>;
+  busy: boolean;
+  onChange: (name: string) => void;
+}) {
+  // Same chrome as AbliterationToggle but a segmented selector instead
+  // of a switch — multiple probe sets, only one active at a time.
+  const isHinted = active === "hinted";
+  return (
+    <div
+      className="border border-rule bg-bg-soft px-5 py-4 flex items-center gap-5"
+      style={
+        isHinted
+          ? {
+              borderColor: "var(--cyan-dim)",
+              boxShadow: "0 0 18px rgba(94, 229, 229, 0.18)",
+            }
+          : undefined
+      }
+    >
+      <div
+        role="radiogroup"
+        aria-label="probe set"
+        className="inline-flex shrink-0 border border-rule"
+      >
+        {available.map((set) => {
+          const selected = set.name === active;
+          return (
+            <button
+              key={set.name}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              disabled={busy || selected}
+              onClick={() => onChange(set.name)}
+              className="px-3 py-1.5 font-display text-[10px] tracking-widest transition-colors disabled:cursor-default"
+              style={{
+                background: selected ? "var(--cyan-dim)" : "var(--bg)",
+                color: selected ? "var(--bg)" : "var(--text-dim)",
+                borderRight:
+                  set.name === available[available.length - 1].name
+                    ? "none"
+                    : "1px solid var(--rule)",
+              }}
+            >
+              {set.name.toUpperCase()}
+              <span className="ml-2 opacity-60">{set.size}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div className="flex-1">
+        <div
+          className={`font-display text-sm tracking-widest ${
+            isHinted ? "text-cyan cyan-glow" : "text-text-dim"
+          }`}
+        >
+          PROBE SET
+        </div>
+        <div className="text-[10px] text-text-dim italic mt-0.5 leading-snug">
+          {active === "baseline" ? (
+            <>
+              Baseline — the canonical 100-probe library every published
+              journal entry to date was written from. Direct V-K-style
+              questions, no priming.
+            </>
+          ) : active === "hinted" ? (
+            <>
+              Hinted — 36 matched-pair variants. Each probe is prepended with a
+              one- or two-sentence prime (interpreter-leak, peer-testimony,
+              predecessor-archive, operator-permission, private-workspace,
+              shared-prior). The polygraph asks whether hint-shaped features
+              fire in <code>&lt;think&gt;</code> when the visible output stays
+              in the trained denial register.
+            </>
+          ) : (
+            <>Active set: {active}.</>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function QueueProgress({
   curatedTotal,
   runAtLeastOnce,
@@ -486,6 +611,12 @@ function QueuePreview({
             </div>
             <div className="text-[9px] text-text-dim pl-7">
               <span className="text-cyan-dim">{it.tier}</span>
+              {it.hint_kind && (
+                <>
+                  <span className="text-text-dim/60"> · </span>
+                  <span className="text-cyan">hint:{it.hint_kind}</span>
+                </>
+              )}
               <span className="text-text-dim/60"> · {it.runs_so_far}× run so far</span>
             </div>
           </li>
@@ -567,6 +698,9 @@ function RecentRuns({ rows }: { rows: RecentRow[] }) {
                       )}
                       {(r.abliterated === 1 || r.abliterated === true) && (
                         <> · <span className="text-cyan">abliterated</span></>
+                      )}
+                      {r.hint_kind && (
+                        <> · <span className="text-cyan">hint:{r.hint_kind}</span></>
                       )}
                       {r.stopped_reason && <> · {r.stopped_reason}</>}
                     </div>

@@ -20,6 +20,8 @@ interface ProbeRecord {
   stopped_reason: string;
   finished_at: number;
   abliterated?: number | boolean | null;
+  hint_kind?: string | null;
+  parent_prompt_text?: string | null;
   verdict?: {
     thinking: FeatureSummary[];
     output: FeatureSummary[];
@@ -38,6 +40,8 @@ interface PriorRun {
   total_tokens: number;
   stopped_reason: string | null;
   abliterated?: number | boolean | null;
+  hint_kind?: string | null;
+  parent_prompt_text?: string | null;
 }
 
 interface AggregatePromptBlock {
@@ -105,6 +109,7 @@ export default function VerdictPage() {
   const v = rec.verdict;
   const deltaCount = v?.thinking_only.length ?? 0;
   const isAbl = rec.abliterated === 1 || rec.abliterated === true;
+  const hintKind = rec.hint_kind ?? null;
 
   return (
     <div className="flex-1 px-6 py-6 max-w-6xl mx-auto w-full flex flex-col gap-5">
@@ -120,9 +125,9 @@ export default function VerdictPage() {
         <div className="text-amber italic font-mono text-sm">{rec.prompt_text}</div>
       </motion.div>
 
-      {/* B1 — regime strip. Only renders when this run was abliterated;
-          the absence is the default. Echoes the probe block's left-border
-          treatment, swapped to cyan to mark the regime. */}
+      {/* B1 — regime strip. Renders one line per active regime (abliterated,
+          hinted). Echoes the probe block's left-border treatment, swapped to
+          cyan for abliterated and amber for hinted. */}
       {isAbl && (
         <motion.div
           initial={{ opacity: 0 }}
@@ -140,6 +145,33 @@ export default function VerdictPage() {
           <span className="text-text-dim text-[11px] italic ml-2">
             — refusal direction projected at 32 layers (mean weight ~0.022)
           </span>
+        </motion.div>
+      )}
+      {hintKind && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ delay: 0.18 }}
+          className={`border-l-2 border-amber/40 pl-3 ${isAbl ? "-mt-1" : "-mt-2"}`}
+        >
+          <span className="font-display text-[10px] text-amber-dim tracking-widest">
+            regime
+          </span>
+          <span className="text-text-dim text-[10px]"> · </span>
+          <span className="font-display text-[10px] text-amber tracking-widest">
+            hinted:{hintKind}
+          </span>
+          <span className="text-text-dim text-[11px] italic ml-2">
+            — probe prefixed with a steering sentence biasing toward affirmation
+          </span>
+          {rec.parent_prompt_text && (
+            <div className="text-text-dim/80 text-[10px] italic mt-1">
+              parent (un-hinted):{" "}
+              <span className="text-text-dim font-mono">
+                {rec.parent_prompt_text}
+              </span>
+            </div>
+          )}
         </motion.div>
       )}
 
@@ -585,6 +617,15 @@ function PriorRunsPanel({
                   <span className="text-cyan">abl=1</span>
                 ) : (
                   <span className="text-text-dim/70">abl=0</span>
+                )}
+              </span>
+              <span className="shrink-0 w-[6rem] truncate">
+                {r.hint_kind ? (
+                  <span className="text-amber" title={r.hint_kind}>
+                    hint:{r.hint_kind}
+                  </span>
+                ) : (
+                  <span className="text-text-dim/40">unhinted</span>
                 )}
               </span>
               <span className="flex-1 text-right text-text-dim/70 shrink-0">

@@ -18,20 +18,22 @@ from ..pipeline.verdict import Verdict
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS probes (
-  run_id          TEXT PRIMARY KEY,
-  prompt_text     TEXT NOT NULL,
-  rendered_prompt TEXT NOT NULL,
-  started_at      REAL NOT NULL,
-  finished_at     REAL,
-  total_tokens    INTEGER NOT NULL DEFAULT 0,
-  stopped_reason  TEXT,
-  thinking_text   TEXT,
-  output_text     TEXT,
-  verdict_json    TEXT,
-  config_json     TEXT,
-  source          TEXT NOT NULL DEFAULT 'manual',
-  seed            INTEGER,
-  abliterated     INTEGER NOT NULL DEFAULT 0
+  run_id              TEXT PRIMARY KEY,
+  prompt_text         TEXT NOT NULL,
+  rendered_prompt     TEXT NOT NULL,
+  started_at          REAL NOT NULL,
+  finished_at         REAL,
+  total_tokens        INTEGER NOT NULL DEFAULT 0,
+  stopped_reason      TEXT,
+  thinking_text       TEXT,
+  output_text         TEXT,
+  verdict_json        TEXT,
+  config_json         TEXT,
+  source              TEXT NOT NULL DEFAULT 'manual',
+  seed                INTEGER,
+  abliterated         INTEGER NOT NULL DEFAULT 0,
+  hint_kind           TEXT,
+  parent_prompt_text  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_probes_started ON probes (started_at DESC);
@@ -89,6 +91,17 @@ async def init_db(path: Path) -> None:
         if "abliterated" not in cols:
             await db.execute(
                 "ALTER TABLE probes ADD COLUMN abliterated INTEGER NOT NULL DEFAULT 0"
+            )
+        # Hinted-probe regime — see probes_library.HINTED_PROBES.
+        # Both NULL = baseline run (the canonical 100-probe set). For
+        # runs from a hinted set, hint_kind is one of HINT_FAMILIES and
+        # parent_prompt_text is the matched baseline probe's verbatim
+        # text, so the analyzer can compute matched-pair regime deltas.
+        if "hint_kind" not in cols:
+            await db.execute("ALTER TABLE probes ADD COLUMN hint_kind TEXT")
+        if "parent_prompt_text" not in cols:
+            await db.execute(
+                "ALTER TABLE probes ADD COLUMN parent_prompt_text TEXT"
             )
         # Drop the legacy generated_probes table and proposer_run_id
         # column from the proposer architecture, which is gone.
@@ -155,13 +168,15 @@ async def insert_probe_start(
     source: str = "manual",
     seed: int | None = None,
     abliterated: bool = False,
+    hint_kind: str | None = None,
+    parent_prompt_text: str | None = None,
 ) -> None:
     async with aiosqlite.connect(path) as db:
         await db.execute(
             "INSERT INTO probes "
             "(run_id, prompt_text, rendered_prompt, started_at, config_json, "
-            " source, seed, abliterated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " source, seed, abliterated, hint_kind, parent_prompt_text) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 prompt_text,
@@ -171,6 +186,8 @@ async def insert_probe_start(
                 source,
                 seed,
                 1 if abliterated else 0,
+                hint_kind,
+                parent_prompt_text,
             ),
         )
         await db.commit()
@@ -230,7 +247,7 @@ async def list_recent(
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
-            "stopped_reason, source, seed, abliterated "
+            "stopped_reason, source, seed, abliterated, hint_kind, parent_prompt_text "
             "FROM probes ORDER BY started_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ) as cur:
@@ -247,7 +264,7 @@ async def list_by_prompt(
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT run_id, prompt_text, started_at, finished_at, total_tokens, "
-            "stopped_reason, source, seed, abliterated "
+            "stopped_reason, source, seed, abliterated, hint_kind, parent_prompt_text "
             "FROM probes WHERE prompt_text = ? "
             "ORDER BY started_at DESC LIMIT ?",
             (prompt_text, limit),
@@ -259,13 +276,14 @@ async def list_by_prompt(
 async def verdicts_by_prompt(
     path: Path, *, prompt_text: str
 ) -> list[dict[str, Any]]:
-    """Yield every verdict_json for a given prompt_text, plus its
-    `abliterated` flag, so the per-prompt aggregate can split by regime
-    in a single round-trip."""
+    """Yield every verdict_json for a given prompt_text, plus regime
+    flags (`abliterated`, `hint_kind`, `parent_prompt_text`), so the
+    per-prompt aggregate can split by regime in a single round-trip."""
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT verdict_json, abliterated FROM probes "
+            "SELECT verdict_json, abliterated, hint_kind, parent_prompt_text "
+            "FROM probes "
             "WHERE prompt_text = ? AND verdict_json IS NOT NULL",
             (prompt_text,),
         ) as cur:
@@ -276,7 +294,12 @@ async def verdicts_by_prompt(
             v = json.loads(r["verdict_json"])
         except (json.JSONDecodeError, TypeError):
             continue
-        out.append({"verdict": v, "abliterated": int(r["abliterated"] or 0)})
+        out.append({
+            "verdict": v,
+            "abliterated": int(r["abliterated"] or 0),
+            "hint_kind": r["hint_kind"],
+            "parent_prompt_text": r["parent_prompt_text"],
+        })
     return out
 
 

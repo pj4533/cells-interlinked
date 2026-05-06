@@ -53,6 +53,8 @@ async def kickoff_probe(
     seed: int | None = None,
     source: str = "manual",
     abliterate: bool = False,
+    hint_kind: str | None = None,
+    parent_prompt_text: str | None = None,
 ) -> "RunState":
     """Begin a probe run. Returns the registered RunState immediately;
     the actual generation happens in a background task on `state.task`.
@@ -112,6 +114,8 @@ async def kickoff_probe(
         source=source,
         seed=seed,
         abliterated=cfg.abliterate,
+        hint_kind=hint_kind,
+        parent_prompt_text=parent_prompt_text,
     )
 
     state.task = asyncio.create_task(

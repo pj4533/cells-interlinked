@@ -64,6 +64,13 @@ class AutorunController:
     # Runtime-toggleable: if True, every autorun probe is started with
     # abliterate=True. The UI flips this via POST /autorun/abliterate.
     abliterate: bool = False
+    # Runtime-toggleable probe-set selector. The round-robin cycle pulls
+    # from probes_library.PROBE_SETS[probe_set]. Default "baseline" — the
+    # canonical 100-probe library every published journal entry to date
+    # was written from. The UI flips this via POST /autorun/probe-set.
+    # Toggle takes effect on the *next* probe; the in-flight one finishes
+    # under whatever set it started with.
+    probe_set: str = "baseline"
 
     @property
     def running(self) -> bool:
@@ -126,7 +133,9 @@ class AutorunController:
 
         try:
             while not self._stop_requested:
-                item = await probe_queue.next_probe(self.db_path)
+                item = await probe_queue.next_probe(
+                    self.db_path, set_name=self.probe_set
+                )
                 if self._stop_requested:
                     break
 
@@ -136,6 +145,8 @@ class AutorunController:
                         prompt_text=item.prompt_text,
                         source="autorun",
                         abliterate=self.abliterate,
+                        hint_kind=item.hint_kind,
+                        parent_prompt_text=item.parent_text,
                     )
                 except Exception as exc:
                     self._log("error", f"kickoff failed: {exc}")
@@ -208,4 +219,5 @@ class AutorunController:
             "stop_requested": self._stop_requested,
             "current_run_id": self._current_run_id,
             "abliterate": self.abliterate,
+            "probe_set": self.probe_set,
         }
