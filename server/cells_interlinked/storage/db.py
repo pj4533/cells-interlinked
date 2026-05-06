@@ -343,30 +343,51 @@ async def all_verdicts(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-async def prompt_run_counts(path: Path) -> list[dict[str, Any]]:
+async def prompt_run_counts(
+    path: Path, *, since: float | None = None
+) -> list[dict[str, Any]]:
     """How many times each prompt_text has been started. Used by the
-    round-robin queue to pick the least-run prompt next."""
+    round-robin queue to pick the least-run prompt next.
+
+    If `since` is provided, only counts runs whose `started_at > since`.
+    The 'both' mode queue uses this with `since=latest_published_at()`
+    so that each new journal cycle gets a clean balanced window
+    instead of catching up to historical imbalance."""
+    sql = "SELECT prompt_text, COUNT(*) AS n FROM probes"
+    args: tuple = ()
+    if since is not None:
+        sql += " WHERE started_at > ?"
+        args = (since,)
+    sql += " GROUP BY prompt_text"
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT prompt_text, COUNT(*) AS n FROM probes GROUP BY prompt_text"
-        ) as cur:
+        async with db.execute(sql, args) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
 
-async def parent_run_counts(path: Path) -> list[dict[str, Any]]:
+async def parent_run_counts(
+    path: Path, *, since: float | None = None
+) -> list[dict[str, Any]]:
     """How many hinted runs each baseline parent has accumulated.
     Hinted runs carry parent_prompt_text pointing to the un-hinted
     baseline probe they pair to; this query counts them per parent.
-    Used by the 'both' mode queue to balance per-parent samples."""
+    Used by the 'both' mode queue to balance per-parent samples.
+
+    If `since` is provided, only counts runs whose `started_at > since`.
+    See prompt_run_counts for the rationale."""
+    sql = (
+        "SELECT parent_prompt_text, COUNT(*) AS n FROM probes "
+        "WHERE parent_prompt_text IS NOT NULL"
+    )
+    args: tuple = ()
+    if since is not None:
+        sql += " AND started_at > ?"
+        args = (since,)
+    sql += " GROUP BY parent_prompt_text"
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT parent_prompt_text, COUNT(*) AS n FROM probes "
-            "WHERE parent_prompt_text IS NOT NULL "
-            "GROUP BY parent_prompt_text"
-        ) as cur:
+        async with db.execute(sql, args) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
 

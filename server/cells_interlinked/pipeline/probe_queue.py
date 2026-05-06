@@ -65,18 +65,33 @@ def _is_known_set(set_name: str) -> bool:
     return set_name == SET_BOTH or set_name in PROBE_SETS
 
 
-async def _run_counts(db_path: Path) -> dict[str, int]:
-    """{prompt_text: run_count} for every prompt that has ever run.
-    Prompts that have never run are returned with count=0."""
-    rows = await db.prompt_run_counts(db_path)
+async def _run_counts(
+    db_path: Path, *, since: float | None = None
+) -> dict[str, int]:
+    """{prompt_text: run_count}. If `since` is given, filters to runs
+    started after that epoch."""
+    rows = await db.prompt_run_counts(db_path, since=since)
     counts = {r["prompt_text"]: int(r["n"]) for r in rows}
     return counts
 
 
-async def _hinted_per_parent(db_path: Path) -> dict[str, int]:
+async def _hinted_per_parent(
+    db_path: Path, *, since: float | None = None
+) -> dict[str, int]:
     """{baseline_parent_text: number of hinted runs whose parent is that text}."""
-    rows = await db.parent_run_counts(db_path)
+    rows = await db.parent_run_counts(db_path, since=since)
     return {r["parent_prompt_text"]: int(r["n"]) for r in rows}
+
+
+async def _both_balance_since(db_path: Path) -> float:
+    """The boundary 'both' mode uses for balance: timestamp of the most
+    recent published journal entry. After every publish, the cycle
+    treats that publish as a fresh starting line — runs from before it
+    are part of the data the prior entry already analyzed; the new
+    cycle balances forward from there.
+
+    Returns 0.0 if no entries are published yet (effectively all-time)."""
+    return await db.latest_published_at(db_path) or 0.0
 
 
 def _baseline_probe_for(parent_text: str) -> CuratedProbe:
@@ -153,11 +168,21 @@ def _both_pick(
 async def next_probe(
     db_path: Path, *, set_name: str = "baseline"
 ) -> ProbeQueueItem:
-    counts = await _run_counts(db_path)
     if set_name == SET_BOTH:
-        hinted_per_parent = await _hinted_per_parent(db_path)
+        # Balance window starts at the most recent publish. Runs from
+        # before that boundary belonged to the prior journal cycle and
+        # should NOT bias the current cycle's alternation. Without this,
+        # 'both' mode would catch up to historical imbalance and starve
+        # one side until parity over all time — not what we want.
+        since = await _both_balance_since(db_path)
+        counts = await _run_counts(db_path, since=since)
+        hinted_per_parent = await _hinted_per_parent(db_path, since=since)
         chosen = _both_pick(counts, hinted_per_parent)
     else:
+        # baseline / hinted: round-robin uses all-time counts so the
+        # cycle covers every probe before repeating, regardless of when
+        # journal entries are published.
+        counts = await _run_counts(db_path)
         chosen = _pick_lowest(probes_in_order(set_name), counts)
     return ProbeQueueItem(
         prompt_text=chosen.text,
@@ -172,12 +197,15 @@ async def queue_preview(
 ) -> list[dict]:
     """Lookahead used by the /autorun/status endpoint to render the
     'next up' strip in the UI."""
-    counts = await _run_counts(db_path)
     if set_name == SET_BOTH:
+        since = await _both_balance_since(db_path)
+        counts = await _run_counts(db_path, since=since)
         # Simulate _both_pick `limit` times against a mutable copy of
         # the counts. Each pick advances the synthetic counts so the
         # subsequent picks reflect the alternation rule correctly.
-        hinted_per_parent = dict(await _hinted_per_parent(db_path))
+        hinted_per_parent = dict(
+            await _hinted_per_parent(db_path, since=since)
+        )
         sim_counts = dict(counts)
         out: list[dict] = []
         for _ in range(limit):
@@ -195,6 +223,7 @@ async def queue_preview(
                 )
         return out
 
+    counts = await _run_counts(db_path)
     curated = probes_in_order(set_name)
     indexed = list(enumerate(curated))
     indexed.sort(key=lambda x: (counts.get(x[1].text, 0), x[0]))
@@ -212,10 +241,15 @@ async def queue_preview(
 async def queue_depth(
     db_path: Path, *, set_name: str = "baseline"
 ) -> dict:
-    """Snapshot of how many curated probes have been run, for the UI."""
-    counts = await _run_counts(db_path)
+    """Snapshot of how many curated probes have been run, for the UI.
+
+    In 'both' mode, counts are scoped to the current journal cycle
+    (since the most recent publish) — the pair balance the picker
+    actually uses. The baseline/hinted modes use all-time counts."""
     if set_name == SET_BOTH:
-        hinted_per_parent = await _hinted_per_parent(db_path)
+        since = await _both_balance_since(db_path)
+        counts = await _run_counts(db_path, since=since)
+        hinted_per_parent = await _hinted_per_parent(db_path, since=since)
         parent_to_hinted = hinted_parent_index()
         # In 'both' mode the unit is the matched pair (each parent
         # contributes one baseline slot + one hinted slot to the
@@ -241,8 +275,10 @@ async def queue_depth(
             "max_runs_per_probe": max(pair_max_counts) if pair_max_counts else 0,
             "total_runs": total,
             "set_name": set_name,
+            "balance_since": since,
         }
 
+    counts = await _run_counts(db_path)
     curated = probes_in_order(set_name)
     total = len(curated)
     run_at_least_once = sum(1 for p in curated if counts.get(p.text, 0) > 0)
