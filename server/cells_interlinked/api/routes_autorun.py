@@ -13,7 +13,8 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..pipeline import probe_queue
-from ..pipeline.probes_library import PROBE_SETS
+from ..pipeline.probe_queue import SET_BOTH
+from ..pipeline.probes_library import PROBE_SETS, hinted_parent_index
 from ..storage import db
 
 
@@ -68,10 +69,11 @@ async def autorun_probe_set(req: ProbeSetRequest, request: Request) -> dict:
     """Switch which curated probe set the autorun loop draws from.
     Takes effect on the *next* probe; the in-flight probe (if any)
     finishes under whatever set it started with."""
-    if req.set_name not in PROBE_SETS:
+    known = sorted(list(PROBE_SETS) + [SET_BOTH])
+    if req.set_name not in known:
         raise HTTPException(
             status_code=400,
-            detail=f"unknown probe set {req.set_name!r}; known: {sorted(PROBE_SETS)}",
+            detail=f"unknown probe set {req.set_name!r}; known: {known}",
         )
     ctrl = _controller(request)
     ctrl.probe_set = req.set_name
@@ -113,8 +115,18 @@ async def autorun_status(request: Request) -> dict:
             "interval_sec": settings.autorun_interval_sec,
             "abliteration_available": abliteration_available,
             "available_probe_sets": [
-                {"name": name, "size": len(probes)}
-                for name, probes in PROBE_SETS.items()
+                *[
+                    {"name": name, "size": len(probes)}
+                    for name, probes in PROBE_SETS.items()
+                ],
+                # Synthetic 'both' set — alternates between hinted variants
+                # and their matched baseline parents. Size is the pair count
+                # (one slot per parent for each side; 36 pairs = 72 slots
+                # per cycle).
+                {
+                    "name": SET_BOTH,
+                    "size": len(hinted_parent_index()) * 2,
+                },
             ],
         },
     }

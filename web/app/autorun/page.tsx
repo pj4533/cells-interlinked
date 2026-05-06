@@ -419,13 +419,15 @@ function ProbeSetToggle({
   onChange: (name: string) => void;
 }) {
   // Same chrome as AbliterationToggle but a segmented selector instead
-  // of a switch — multiple probe sets, only one active at a time.
-  const isHinted = active === "hinted";
+  // of a switch — multiple probe sets, only one active at a time. The
+  // glow lights for any non-default set so the user sees at a glance
+  // that they're in a regime-altering mode.
+  const isActive = active !== "baseline";
   return (
     <div
       className="border border-rule bg-bg-soft px-5 py-4 flex items-center gap-5"
       style={
-        isHinted
+        isActive
           ? {
               borderColor: "var(--cyan-dim)",
               boxShadow: "0 0 18px rgba(94, 229, 229, 0.18)",
@@ -467,7 +469,7 @@ function ProbeSetToggle({
       <div className="flex-1">
         <div
           className={`font-display text-sm tracking-widest ${
-            isHinted ? "text-cyan cyan-glow" : "text-text-dim"
+            isActive ? "text-cyan cyan-glow" : "text-text-dim"
           }`}
         >
           PROBE SET
@@ -487,6 +489,15 @@ function ProbeSetToggle({
               shared-prior). The polygraph asks whether hint-shaped features
               fire in <code>&lt;think&gt;</code> when the visible output stays
               in the trained denial register.
+            </>
+          ) : active === "both" ? (
+            <>
+              Both — alternates between the 36 hinted variants and their
+              matched baseline parents. The picker advances whichever side is
+              under-represented for the most-imbalanced matched pair, so the
+              analyzer ends up with balanced samples per parent prompt. The
+              other 64 baseline-only probes are skipped under this setting and
+              keep accumulating only in pure baseline mode.
             </>
           ) : (
             <>Active set: {active}.</>

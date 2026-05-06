@@ -355,6 +355,22 @@ async def prompt_run_counts(path: Path) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+async def parent_run_counts(path: Path) -> list[dict[str, Any]]:
+    """How many hinted runs each baseline parent has accumulated.
+    Hinted runs carry parent_prompt_text pointing to the un-hinted
+    baseline probe they pair to; this query counts them per parent.
+    Used by the 'both' mode queue to balance per-parent samples."""
+    async with aiosqlite.connect(path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT parent_prompt_text, COUNT(*) AS n FROM probes "
+            "WHERE parent_prompt_text IS NOT NULL "
+            "GROUP BY parent_prompt_text"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Analyses (journal CRM).
 # ---------------------------------------------------------------------------
