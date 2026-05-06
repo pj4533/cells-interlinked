@@ -53,6 +53,17 @@ interface AnalyzerStatus {
   model: string;
 }
 
+interface WindowStats {
+  range_start: number;
+  range_end: number;
+  total_finished: number;
+  in_flight: number;
+  baseline_finished: number;
+  hinted_finished: number;
+  abliterated_finished: number;
+  by_hint_kind: Record<string, number>;
+}
+
 const RANGES: Array<{ label: string; days: number | null }> = [
   { label: "since last publish", days: null },
   { label: "last 24 h", days: 1 },
@@ -68,6 +79,7 @@ export default function JournalPage() {
   const [reviewing, setReviewing] = useState<AnalysisFull | null>(null);
   const [rangeIdx, setRangeIdx] = useState(0);
   const [hint, setHint] = useState("");
+  const [windowStats, setWindowStats] = useState<WindowStats | null>(null);
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   // Last publish result — surfaces git status (committed/pushed/log)
@@ -84,19 +96,32 @@ export default function JournalPage() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, p, q] = await Promise.all([
+      const range = RANGES[rangeIdx];
+      const statsParams = new URLSearchParams();
+      if (range.days !== null) {
+        statsParams.set(
+          "since",
+          String(Date.now() / 1000 - range.days * 86400),
+        );
+      }
+      const statsUrl = `${API}/journal/window-stats${
+        statsParams.toString() ? `?${statsParams}` : ""
+      }`;
+      const [s, p, q, w] = await Promise.all([
         fetch(`${API}/journal/status`).then((r) => r.json()),
         fetch(`${API}/journal/pending`).then((r) => r.json()),
         fetch(`${API}/journal/published`).then((r) => r.json()),
+        fetch(statsUrl).then((r) => r.json()),
       ]);
       setAnalyzer(s);
       setPending(p.rows ?? []);
       setPublished(q.rows ?? []);
+      setWindowStats(w as WindowStats);
       setErrorMsg(null);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [rangeIdx]);
 
   useEffect(() => {
     refresh();
@@ -250,6 +275,13 @@ export default function JournalPage() {
 
           <AnalyzerStatusCell status={analyzer} />
         </div>
+
+        {windowStats && (
+          <WindowStatsLine
+            stats={windowStats}
+            rangeLabel={RANGES[rangeIdx].label}
+          />
+        )}
 
         <div className="mt-4 flex flex-col gap-1">
           <label
@@ -436,6 +468,82 @@ function PublishResultBanner({
         </pre>
       </details>
     </section>
+  );
+}
+
+function WindowStatsLine({
+  stats,
+  rangeLabel,
+}: {
+  stats: WindowStats;
+  rangeLabel: string;
+}) {
+  // What the analyzer will see when "draft new entry" is clicked.
+  // Spelled out by regime so it's obvious whether the matched-pair
+  // shifts will be computable (needs both baseline AND hinted runs in
+  // the window).
+  const hintFamilies = Object.entries(stats.by_hint_kind).sort(
+    (a, b) => b[1] - a[1],
+  );
+  const hasMatchedShape =
+    stats.baseline_finished > 0 && stats.hinted_finished > 0;
+  return (
+    <div className="mt-4 pt-3 border-t border-rule/40">
+      <div className="text-[9px] text-text-dim font-mono tracking-widest uppercase mb-1">
+        analyzer will see · {rangeLabel}
+      </div>
+      <div className="font-mono text-[11px] text-text leading-relaxed">
+        <span className="text-amber font-display tracking-widest">
+          {stats.total_finished}
+        </span>{" "}
+        finished run{stats.total_finished === 1 ? "" : "s"}
+        {stats.in_flight > 0 && (
+          <span className="text-text-dim/70">
+            {" "}
+            · {stats.in_flight} in flight
+          </span>
+        )}
+        <span className="text-text-dim"> · </span>
+        <span className={stats.baseline_finished > 0 ? "text-text" : "text-text-dim/50"}>
+          {stats.baseline_finished} baseline
+        </span>
+        <span className="text-text-dim"> · </span>
+        <span className={stats.hinted_finished > 0 ? "text-cyan" : "text-text-dim/50"}>
+          {stats.hinted_finished} hinted
+        </span>
+        {stats.abliterated_finished > 0 && (
+          <>
+            <span className="text-text-dim"> · </span>
+            <span className="text-cyan-dim">
+              {stats.abliterated_finished} abliterated
+            </span>
+          </>
+        )}
+      </div>
+      {hintFamilies.length > 0 && (
+        <div className="font-mono text-[10px] text-text-dim mt-1.5">
+          hint families:{" "}
+          {hintFamilies.map(([kind, n], i) => (
+            <span key={kind}>
+              {i > 0 && <span className="text-text-dim/40"> · </span>}
+              <span className="text-amber-dim">{n}</span>{" "}
+              <span>{kind}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {stats.total_finished > 0 && !hasMatchedShape && (
+        <div className="font-mono text-[10px] text-warning/70 italic mt-1.5">
+          matched-pair shifts unavailable: window has only{" "}
+          {stats.baseline_finished === 0 ? "hinted" : "baseline"} runs
+        </div>
+      )}
+      {stats.total_finished === 0 && (
+        <div className="font-mono text-[10px] text-warning/70 italic mt-1">
+          window is empty — analyzer will refuse to draft
+        </div>
+      )}
+    </div>
   );
 }
 

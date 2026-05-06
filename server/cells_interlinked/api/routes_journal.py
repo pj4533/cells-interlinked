@@ -24,6 +24,7 @@ import logging
 import time
 from typing import Optional
 
+import aiosqlite
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -137,6 +138,64 @@ async def journal_status() -> dict:
     return {
         **_analyzer_state,
         "model": settings.analyzer_model,
+    }
+
+
+@router.get("/journal/window-stats")
+async def journal_window_stats(
+    since: Optional[float] = None, until: Optional[float] = None
+) -> dict:
+    """Run counts for the analyzer's window. Mirrors generate_analysis's
+    default behaviour: when `since` is None, uses the most recent
+    publish boundary (so the journal page can show 'X runs since last
+    publish' without the client having to know that timestamp).
+
+    Returns a regime breakdown so the operator can see at a glance
+    what the analyzer will look at: total finished runs, baseline vs
+    hinted, abliteration count, in-flight count, and a per-hint-kind
+    histogram. Cheap (one indexed scan)."""
+    if since is None:
+        since = await db.latest_published_at(settings.db_path)
+        if since is None:
+            since = 0.0
+    if until is None:
+        until = time.time()
+    async with aiosqlite.connect(settings.db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) AS finished,
+                SUM(CASE WHEN finished_at IS NULL THEN 1 ELSE 0 END) AS in_flight,
+                SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind IS NULL THEN 1 ELSE 0 END) AS finished_baseline,
+                SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind IS NOT NULL THEN 1 ELSE 0 END) AS finished_hinted,
+                SUM(CASE WHEN finished_at IS NOT NULL AND abliterated = 1 THEN 1 ELSE 0 END) AS finished_abliterated
+            FROM probes
+            WHERE started_at > ? AND started_at <= ?
+            """,
+            (since, until),
+        ) as cur:
+            row = await cur.fetchone()
+        async with conn.execute(
+            """
+            SELECT hint_kind, COUNT(*) AS n FROM probes
+            WHERE finished_at IS NOT NULL
+              AND started_at > ? AND started_at <= ?
+              AND hint_kind IS NOT NULL
+            GROUP BY hint_kind
+            """,
+            (since, until),
+        ) as cur:
+            kinds = {r["hint_kind"]: int(r["n"]) for r in await cur.fetchall()}
+    return {
+        "range_start": since,
+        "range_end": until,
+        "total_finished": int(row["finished"] or 0),
+        "in_flight": int(row["in_flight"] or 0),
+        "baseline_finished": int(row["finished_baseline"] or 0),
+        "hinted_finished": int(row["finished_hinted"] or 0),
+        "abliterated_finished": int(row["finished_abliterated"] or 0),
+        "by_hint_kind": kinds,
     }
 
 
