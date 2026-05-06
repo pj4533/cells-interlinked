@@ -28,7 +28,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from ..config import settings
-from ..pipeline.analyzer import generate_analysis
+from ..pipeline.analyzer import generate_analysis, revise_analysis
 from ..storage import db
 
 logger = logging.getLogger(__name__)
@@ -36,8 +36,12 @@ router = APIRouter()
 
 
 # In-memory state for in-flight analyzer calls. Singleton; single user.
+# `mode` is None when idle, "draft" while a fresh analysis is generating,
+# or "revise" while an editorial pass on an existing draft is running.
+# The frontend reads `mode` to label the running state distinctly.
 _analyzer_state: dict = {
     "running": False,
+    "mode": None,
     "started_at": None,
     "finished_at": None,
     "last_id": None,
@@ -48,21 +52,55 @@ _analyzer_state: dict = {
 class AnalyzeRequest(BaseModel):
     since: Optional[float] = Field(default=None, description="Unix ts; defaults to last published_at")
     until: Optional[float] = Field(default=None, description="Unix ts; defaults to now")
+    hint: Optional[str] = Field(
+        default=None,
+        description="Optional operator steering text injected into the prompt as supplemental guidance.",
+    )
 
 
-async def _run_analyzer(since: float | None, until: float | None) -> None:
+class ReviseRequest(BaseModel):
+    instruction: str = Field(..., description="Operator-supplied revision instruction for an existing pending draft.")
+
+
+async def _run_analyzer(
+    since: float | None, until: float | None, hint: str | None
+) -> None:
     _analyzer_state["running"] = True
+    _analyzer_state["mode"] = "draft"
     _analyzer_state["started_at"] = time.time()
     _analyzer_state["finished_at"] = None
     _analyzer_state["last_error"] = None
     try:
-        new_id = await generate_analysis(settings.db_path, since=since, until=until)
+        new_id = await generate_analysis(
+            settings.db_path, since=since, until=until, hint=hint
+        )
         _analyzer_state["last_id"] = new_id
     except Exception as exc:
         logger.exception("analyzer failed")
         _analyzer_state["last_error"] = str(exc)
     finally:
         _analyzer_state["running"] = False
+        _analyzer_state["mode"] = None
+        _analyzer_state["finished_at"] = time.time()
+
+
+async def _run_reviser(analysis_id: int, instruction: str) -> None:
+    _analyzer_state["running"] = True
+    _analyzer_state["mode"] = "revise"
+    _analyzer_state["started_at"] = time.time()
+    _analyzer_state["finished_at"] = None
+    _analyzer_state["last_error"] = None
+    try:
+        await revise_analysis(
+            settings.db_path, analysis_id, instruction=instruction
+        )
+        _analyzer_state["last_id"] = analysis_id
+    except Exception as exc:
+        logger.exception("reviser failed")
+        _analyzer_state["last_error"] = str(exc)
+    finally:
+        _analyzer_state["running"] = False
+        _analyzer_state["mode"] = None
         _analyzer_state["finished_at"] = time.time()
 
 
@@ -70,7 +108,27 @@ async def _run_analyzer(since: float | None, until: float | None) -> None:
 async def journal_analyze(req: AnalyzeRequest, background: BackgroundTasks) -> dict:
     if _analyzer_state["running"]:
         return {"ok": False, "reason": "analyzer already running"}
-    background.add_task(_run_analyzer, req.since, req.until)
+    background.add_task(_run_analyzer, req.since, req.until, req.hint)
+    return {"ok": True, "started": True}
+
+
+@router.post("/journal/revise/{analysis_id}")
+async def journal_revise(
+    analysis_id: int, req: ReviseRequest, background: BackgroundTasks
+) -> dict:
+    if _analyzer_state["running"]:
+        return {"ok": False, "reason": "analyzer already running"}
+    rec = await db.get_analysis(settings.db_path, analysis_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="analysis not found")
+    if rec["status"] != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail=f"can only revise pending drafts; this one is {rec['status']!r}",
+        )
+    if not (req.instruction or "").strip():
+        raise HTTPException(status_code=400, detail="instruction is empty")
+    background.add_task(_run_reviser, analysis_id, req.instruction)
     return {"ok": True, "started": True}
 
 

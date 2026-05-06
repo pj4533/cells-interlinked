@@ -45,6 +45,7 @@ interface AnalysisFull extends AnalysisRow {
 
 interface AnalyzerStatus {
   running: boolean;
+  mode: "draft" | "revise" | null;
   started_at: number | null;
   finished_at: number | null;
   last_id: number | null;
@@ -66,6 +67,7 @@ export default function JournalPage() {
   const [published, setPublished] = useState<AnalysisRow[]>([]);
   const [reviewing, setReviewing] = useState<AnalysisFull | null>(null);
   const [rangeIdx, setRangeIdx] = useState(0);
+  const [hint, setHint] = useState("");
   const [busy, setBusy] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   // Last publish result — surfaces git status (committed/pushed/log)
@@ -110,16 +112,42 @@ export default function JournalPage() {
     setBusy(true);
     try {
       const range = RANGES[rangeIdx];
-      const body: { since?: number; until?: number } = {};
+      const body: { since?: number; until?: number; hint?: string } = {};
       if (range.days !== null) {
         body.since = Date.now() / 1000 - range.days * 86400;
       }
+      const trimmedHint = hint.trim();
+      if (trimmedHint) body.hint = trimmedHint;
       await fetch(`${API}/journal/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRevise = async (id: number, instruction: string) => {
+    if (busy || analyzer?.running) return;
+    const trimmed = instruction.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setErrorMsg(null);
+    try {
+      const resp = await fetch(`${API}/journal/revise/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ instruction: trimmed }),
+      }).then((r) => r.json());
+      if (!resp.ok) {
+        setErrorMsg(resp.reason || resp.detail || "revise failed");
+      }
+      await refresh();
+      setReviewing(null);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy(false);
     }
@@ -194,7 +222,11 @@ export default function JournalPage() {
               onClick={onAnalyze}
               disabled={busy || analyzer?.running}
             >
-              {analyzer?.running ? "drafting…" : "draft new entry"}
+              {analyzer?.running
+                ? analyzer.mode === "revise"
+                  ? "revising…"
+                  : "drafting…"
+                : "draft new entry"}
             </button>
 
             <div className="flex flex-col gap-1">
@@ -218,6 +250,25 @@ export default function JournalPage() {
 
           <AnalyzerStatusCell status={analyzer} />
         </div>
+
+        <div className="mt-4 flex flex-col gap-1">
+          <label
+            htmlFor="journal-hint"
+            className="text-[9px] text-text-dim font-mono tracking-widest uppercase"
+          >
+            optional hint — steers Opus for this draft only
+          </label>
+          <textarea
+            id="journal-hint"
+            value={hint}
+            onChange={(e) => setHint(e.target.value)}
+            disabled={analyzer?.running}
+            rows={2}
+            placeholder="e.g. we added abliteration since last entry — focus on what changed in the matched-prompt regime shifts"
+            className="bg-bg border border-rule text-text px-2 py-1 text-xs font-mono leading-relaxed focus:border-amber-dim focus:outline-none placeholder:text-text-dim/50 resize-y"
+          />
+        </div>
+
         {analyzer?.last_error && (
           <div className="mt-4 text-warning text-xs font-mono italic">
             last error: {analyzer.last_error}
@@ -317,7 +368,9 @@ export default function JournalPage() {
           onPublish={() => onPublish(reviewing.id)}
           onReject={() => onReject(reviewing.id)}
           onDelete={() => onDelete(reviewing.id)}
+          onRevise={(instruction) => onRevise(reviewing.id, instruction)}
           busy={busy}
+          analyzerRunning={!!analyzer?.running}
         />
       )}
     </div>
@@ -414,7 +467,7 @@ function AnalyzerStatusCell({ status }: { status: AnalyzerStatus | null }) {
   if (!status) return null;
   const statePill = status.running ? (
     <span className="font-display text-xs text-cyan cyan-glow tracking-widest">
-      RUNNING
+      {status.mode === "revise" ? "REVISING" : "RUNNING"}
     </span>
   ) : status.last_error ? (
     <span className="font-display text-xs text-warning tracking-widest">
@@ -488,16 +541,23 @@ function ReviewModal({
   onPublish,
   onReject,
   onDelete,
+  onRevise,
   busy,
+  analyzerRunning,
 }: {
   analysis: AnalysisFull;
   onClose: () => void;
   onPublish: () => void;
   onReject: () => void;
   onDelete: () => void;
+  onRevise: (instruction: string) => void;
   busy: boolean;
+  analyzerRunning: boolean;
 }) {
   const isPending = analysis.status === "pending";
+  const [revision, setRevision] = useState("");
+  const reviseDisabled =
+    busy || analyzerRunning || revision.trim().length === 0;
   return (
     <div
       className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/85 backdrop-blur-sm p-6"
@@ -534,6 +594,44 @@ function ReviewModal({
             {analysis.body_markdown}
           </pre>
         </article>
+
+        {isPending && (
+          <div className="px-6 py-4 border-t border-rule shrink-0 bg-bg/40">
+            <div className="flex items-baseline justify-between mb-2">
+              <label
+                htmlFor="revise-instruction"
+                className="text-[9px] text-text-dim font-mono tracking-widest uppercase"
+              >
+                revise — ask Opus for fixes instead of hand-editing
+              </label>
+              <span className="text-[9px] text-text-dim font-mono italic">
+                regenerates this draft in place; metadata preserved
+              </span>
+            </div>
+            <textarea
+              id="revise-instruction"
+              value={revision}
+              onChange={(e) => setRevision(e.target.value)}
+              disabled={busy || analyzerRunning}
+              rows={3}
+              placeholder="e.g. tighten the opening paragraph, drop the sci-fi metaphor in section 2, lean harder on the matched-prompt shift on prompt #4"
+              className="w-full bg-bg border border-rule text-text px-2 py-1 text-xs font-mono leading-relaxed focus:border-amber-dim focus:outline-none placeholder:text-text-dim/50 resize-y"
+            />
+            <div className="mt-2 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => {
+                  onRevise(revision);
+                  setRevision("");
+                }}
+                disabled={reviseDisabled}
+                className="font-display text-[10px] tracking-widest px-3 py-1.5 border border-amber-dim text-amber hover:bg-amber hover:text-bg disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:text-amber transition-colors"
+              >
+                {analyzerRunning ? "analyzer busy…" : "ask Opus to revise"}
+              </button>
+            </div>
+          </div>
+        )}
 
         <footer className="px-6 py-4 border-t border-rule flex items-center justify-between shrink-0">
           <button

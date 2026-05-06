@@ -419,6 +419,24 @@ async def update_analysis_status(
         await db.commit()
 
 
+async def update_analysis_content(
+    path: Path,
+    analysis_id: int,
+    *,
+    title: str,
+    slug: str,
+    summary: str,
+    body_markdown: str,
+) -> None:
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            "UPDATE analyses SET title = ?, slug = ?, summary = ?, "
+            "body_markdown = ? WHERE id = ?",
+            (title, slug, summary, body_markdown, analysis_id),
+        )
+        await db.commit()
+
+
 async def delete_analysis(path: Path, analysis_id: int) -> None:
     async with aiosqlite.connect(path) as db:
         await db.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
