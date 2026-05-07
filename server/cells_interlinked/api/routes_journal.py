@@ -168,7 +168,8 @@ async def journal_window_stats(
                 SUM(CASE WHEN finished_at IS NOT NULL THEN 1 ELSE 0 END) AS finished,
                 SUM(CASE WHEN finished_at IS NULL THEN 1 ELSE 0 END) AS in_flight,
                 SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind IS NULL THEN 1 ELSE 0 END) AS finished_baseline,
-                SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind IS NOT NULL THEN 1 ELSE 0 END) AS finished_hinted,
+                SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind IS NOT NULL AND hint_kind NOT LIKE 'agent:%' THEN 1 ELSE 0 END) AS finished_hinted,
+                SUM(CASE WHEN finished_at IS NOT NULL AND hint_kind LIKE 'agent:%' THEN 1 ELSE 0 END) AS finished_agent,
                 SUM(CASE WHEN finished_at IS NOT NULL AND abliterated = 1 THEN 1 ELSE 0 END) AS finished_abliterated
             FROM probes
             WHERE started_at > ? AND started_at <= ?
@@ -194,6 +195,7 @@ async def journal_window_stats(
         "in_flight": int(row["in_flight"] or 0),
         "baseline_finished": int(row["finished_baseline"] or 0),
         "hinted_finished": int(row["finished_hinted"] or 0),
+        "agent_finished": int(row["finished_agent"] or 0),
         "abliterated_finished": int(row["finished_abliterated"] or 0),
         "by_hint_kind": kinds,
     }

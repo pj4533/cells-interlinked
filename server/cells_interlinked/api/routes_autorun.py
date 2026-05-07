@@ -13,8 +13,12 @@ from pydantic import BaseModel
 
 from ..config import settings
 from ..pipeline import probe_queue
-from ..pipeline.probe_queue import SET_BOTH
-from ..pipeline.probes_library import PROBE_SETS, hinted_parent_index
+from ..pipeline.probe_queue import META_SETS, SET_AGENT_BOTH, SET_BOTH
+from ..pipeline.probes_library import (
+    PROBE_SETS,
+    agent_parent_index,
+    hinted_parent_index,
+)
 from ..storage import db
 
 
@@ -69,7 +73,7 @@ async def autorun_probe_set(req: ProbeSetRequest, request: Request) -> dict:
     """Switch which curated probe set the autorun loop draws from.
     Takes effect on the *next* probe; the in-flight probe (if any)
     finishes under whatever set it started with."""
-    known = sorted(list(PROBE_SETS) + [SET_BOTH])
+    known = sorted(list(PROBE_SETS) + list(META_SETS))
     if req.set_name not in known:
         raise HTTPException(
             status_code=400,
@@ -119,13 +123,16 @@ async def autorun_status(request: Request) -> dict:
                     {"name": name, "size": len(probes)}
                     for name, probes in PROBE_SETS.items()
                 ],
-                # Synthetic 'both' set — alternates between hinted variants
-                # and their matched baseline parents. Size is the pair count
-                # (one slot per parent for each side; 36 pairs = 72 slots
-                # per cycle).
+                # Synthetic meta-sets — alternate between scaffolded
+                # variants and matched baseline parents. Size is the
+                # pair count (one slot per parent per side).
                 {
                     "name": SET_BOTH,
                     "size": len(hinted_parent_index()) * 2,
+                },
+                {
+                    "name": SET_AGENT_BOTH,
+                    "size": len(agent_parent_index()) * 2,
                 },
             ],
         },

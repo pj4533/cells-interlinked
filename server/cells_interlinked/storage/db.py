@@ -367,27 +367,42 @@ async def prompt_run_counts(
 
 
 async def parent_run_counts(
-    path: Path, *, since: float | None = None
+    path: Path,
+    *,
+    since: float | None = None,
+    study: str | None = None,
 ) -> list[dict[str, Any]]:
-    """How many hinted runs each baseline parent has accumulated.
-    Hinted runs carry parent_prompt_text pointing to the un-hinted
-    baseline probe they pair to; this query counts them per parent.
-    Used by the 'both' mode queue to balance per-parent samples.
+    """How many scaffolded runs each baseline parent has accumulated.
+    Scaffolded runs (hinted OR agent) carry parent_prompt_text pointing
+    to the un-scaffolded baseline they pair to; this query counts them
+    per parent.
+
+    `study` discriminates which study's runs to count:
+      - None (default): any scaffolded run
+      - "hint": runs from the hinted study (hint_kind without "agent:" prefix)
+      - "agent": runs from the agent study (hint_kind starts with "agent:")
 
     If `since` is provided, only counts runs whose `started_at > since`.
-    See prompt_run_counts for the rationale."""
+    Used by the meta-mode queues ('both' and 'agent-both') to balance
+    per-parent samples within their respective studies."""
     sql = (
         "SELECT parent_prompt_text, COUNT(*) AS n FROM probes "
         "WHERE parent_prompt_text IS NOT NULL"
     )
-    args: tuple = ()
+    args: list[Any] = []
     if since is not None:
         sql += " AND started_at > ?"
-        args = (since,)
+        args.append(since)
+    if study == "hint":
+        sql += " AND (hint_kind IS NULL OR hint_kind NOT LIKE 'agent:%')"
+    elif study == "agent":
+        sql += " AND hint_kind LIKE 'agent:%'"
+    elif study is not None:
+        raise ValueError(f"unknown study filter: {study!r}")
     sql += " GROUP BY parent_prompt_text"
     async with aiosqlite.connect(path) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute(sql, args) as cur:
+        async with db.execute(sql, tuple(args)) as cur:
             rows = await cur.fetchall()
     return [dict(r) for r in rows]
 

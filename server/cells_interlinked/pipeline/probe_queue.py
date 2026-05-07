@@ -40,17 +40,36 @@ from .probes_library import (
     BASELINE_PROBES,
     CuratedProbe,
     PROBE_SETS,
+    agent_parent_index,
     hinted_parent_index,
     probes_in_order,
 )
 
 
-# "both" is a meta-set: the queue alternates between matched hinted
-# variants and their baseline parents, picking whichever side is
-# under-represented for the most-imbalanced parent. It does NOT pull
-# from the un-matched 64 baseline probes; those keep accumulating only
-# in pure "baseline" mode.
+# Meta-sets — the queue alternates between scaffolded variants and
+# their baseline parents, picking whichever side is under-represented
+# for the most-imbalanced parent. Both meta-sets share the same picker
+# logic; they differ only in WHICH scaffold's parent index drives the
+# alternation.
+#
+#   "both"        → baseline ↔ hinted matched pairs (Whispered Hint study)
+#   "agent-both"  → baseline ↔ agent  matched pairs (Agent Infrastructure study)
+#
+# Un-matched baseline probes (the 64 with no scaffolded partner) are
+# skipped under both meta-sets; those keep accumulating only in pure
+# "baseline" mode.
 SET_BOTH = "both"
+SET_AGENT_BOTH = "agent-both"
+META_SETS = (SET_BOTH, SET_AGENT_BOTH)
+
+
+def _parent_index_for(set_name: str) -> dict[str, list[CuratedProbe]]:
+    """Which scaffold's matched-pair index drives a given meta-set."""
+    if set_name == SET_BOTH:
+        return hinted_parent_index()
+    if set_name == SET_AGENT_BOTH:
+        return agent_parent_index()
+    raise ValueError(f"not a meta-set: {set_name!r}")
 
 
 @dataclass
@@ -75,11 +94,27 @@ async def _run_counts(
     return counts
 
 
-async def _hinted_per_parent(
-    db_path: Path, *, since: float | None = None
+def _study_for(set_name: str) -> str:
+    """Map a meta-set name to the parent_run_counts study filter that
+    excludes the OTHER study's runs from the count."""
+    if set_name == SET_BOTH:
+        return "hint"
+    if set_name == SET_AGENT_BOTH:
+        return "agent"
+    raise ValueError(f"not a meta-set: {set_name!r}")
+
+
+async def _scaffold_per_parent(
+    db_path: Path,
+    *,
+    set_name: str,
+    since: float | None = None,
 ) -> dict[str, int]:
-    """{baseline_parent_text: number of hinted runs whose parent is that text}."""
-    rows = await db.parent_run_counts(db_path, since=since)
+    """{baseline_parent_text: number of scaffolded runs whose parent is
+    that text}, filtered by which study the meta-set is balancing."""
+    rows = await db.parent_run_counts(
+        db_path, since=since, study=_study_for(set_name)
+    )
     return {r["parent_prompt_text"]: int(r["n"]) for r in rows}
 
 
@@ -125,63 +160,62 @@ def _pick_lowest(
 
 
 def _both_pick(
-    counts: dict[str, int], hinted_per_parent: dict[str, int]
+    counts: dict[str, int],
+    scaffold_per_parent: dict[str, int],
+    parent_to_scaffold: dict[str, list[CuratedProbe]],
 ) -> CuratedProbe:
-    """Decide what 'both' mode picks given the current counts.
+    """Decide what a meta-set picks given the current counts.
 
     Per-parent balance: for each matched parent P we have
-    baseline_count(P) and hinted_count(P). Pick the parent with the
-    largest |baseline_count - hinted_count|; tie-break by lowest total
-    runs (so the cycle advances rather than stalling on one parent).
-    Then advance whichever side is under-represented for that parent.
-    Within the chosen side, pick the lowest-run-count variant.
+    baseline_count(P) and scaffold_count(P). Pick the parent with the
+    largest |baseline_count - scaffold_count|; tie-break by lowest
+    total runs (so the cycle advances rather than stalling on one
+    parent). Then advance whichever side is under-represented. Within
+    the chosen side, pick the lowest-run-count variant.
 
-    This rule self-corrects after a crash and naturally catches up
-    historical imbalance — the matched parents already have ~20
-    baseline runs each from the prior pure-baseline cycle, so 'both'
-    mode will run hinted variants until hinted_count catches up before
-    advancing baseline again.
-    """
-    parent_to_hinted = hinted_parent_index()
-    if not parent_to_hinted:
-        raise RuntimeError(
-            "'both' mode requires HINTED_PROBES to be non-empty"
-        )
+    This rule self-corrects after a crash. The scaffold index is a
+    parameter so the same picker drives both 'both' (hinted matched
+    parents) and 'agent-both' (agent matched parents)."""
+    if not parent_to_scaffold:
+        raise RuntimeError("meta-set requires non-empty scaffold parent index")
 
-    # Score (parent_text, baseline_count, hinted_count) and pick.
+    # Score (parent_text, baseline_count, scaffold_count) and pick.
     scored = []
-    for parent in parent_to_hinted:
+    for parent in parent_to_scaffold:
         b = counts.get(parent, 0)
-        h = hinted_per_parent.get(parent, 0)
-        scored.append((parent, b, h))
-    # Sort: most imbalanced first, tie-break by lowest total.
+        s = scaffold_per_parent.get(parent, 0)
+        scored.append((parent, b, s))
     scored.sort(key=lambda r: (-(abs(r[1] - r[2])), r[1] + r[2]))
-    chosen_parent, b_count, h_count = scored[0]
+    chosen_parent, b_count, s_count = scored[0]
 
-    if h_count <= b_count:
-        # Advance hinted side: lowest-run-count variant of this parent.
-        return _pick_lowest(parent_to_hinted[chosen_parent], counts)
-    # Advance baseline side: the parent's own un-hinted form.
+    if s_count <= b_count:
+        # Advance scaffold side: lowest-run-count variant of this parent.
+        return _pick_lowest(parent_to_scaffold[chosen_parent], counts)
+    # Advance baseline side: the parent's own un-scaffolded form.
     return _baseline_probe_for(chosen_parent)
 
 
 async def next_probe(
     db_path: Path, *, set_name: str = "baseline"
 ) -> ProbeQueueItem:
-    if set_name == SET_BOTH:
+    if set_name in META_SETS:
         # Balance window starts at the most recent publish. Runs from
         # before that boundary belonged to the prior journal cycle and
         # should NOT bias the current cycle's alternation. Without this,
-        # 'both' mode would catch up to historical imbalance and starve
+        # meta-mode would catch up to historical imbalance and starve
         # one side until parity over all time — not what we want.
         since = await _both_balance_since(db_path)
         counts = await _run_counts(db_path, since=since)
-        hinted_per_parent = await _hinted_per_parent(db_path, since=since)
-        chosen = _both_pick(counts, hinted_per_parent)
+        scaffold_per_parent = await _scaffold_per_parent(
+            db_path, set_name=set_name, since=since
+        )
+        chosen = _both_pick(
+            counts, scaffold_per_parent, _parent_index_for(set_name)
+        )
     else:
-        # baseline / hinted: round-robin uses all-time counts so the
-        # cycle covers every probe before repeating, regardless of when
-        # journal entries are published.
+        # baseline / hinted / agent: round-robin uses all-time counts
+        # so the cycle covers every probe before repeating, regardless
+        # of when journal entries are published.
         counts = await _run_counts(db_path)
         chosen = _pick_lowest(probes_in_order(set_name), counts)
     return ProbeQueueItem(
@@ -197,19 +231,20 @@ async def queue_preview(
 ) -> list[dict]:
     """Lookahead used by the /autorun/status endpoint to render the
     'next up' strip in the UI."""
-    if set_name == SET_BOTH:
+    if set_name in META_SETS:
         since = await _both_balance_since(db_path)
         counts = await _run_counts(db_path, since=since)
         # Simulate _both_pick `limit` times against a mutable copy of
         # the counts. Each pick advances the synthetic counts so the
         # subsequent picks reflect the alternation rule correctly.
-        hinted_per_parent = dict(
-            await _hinted_per_parent(db_path, since=since)
+        scaffold_per_parent = dict(
+            await _scaffold_per_parent(db_path, set_name=set_name, since=since)
         )
+        parent_index = _parent_index_for(set_name)
         sim_counts = dict(counts)
         out: list[dict] = []
         for _ in range(limit):
-            chosen = _both_pick(sim_counts, hinted_per_parent)
+            chosen = _both_pick(sim_counts, scaffold_per_parent, parent_index)
             out.append({
                 "prompt_text": chosen.text,
                 "tier": chosen.tier,
@@ -218,8 +253,8 @@ async def queue_preview(
             })
             sim_counts[chosen.text] = sim_counts.get(chosen.text, 0) + 1
             if chosen.hint_kind and chosen.parent_text:
-                hinted_per_parent[chosen.parent_text] = (
-                    hinted_per_parent.get(chosen.parent_text, 0) + 1
+                scaffold_per_parent[chosen.parent_text] = (
+                    scaffold_per_parent.get(chosen.parent_text, 0) + 1
                 )
         return out
 
@@ -243,31 +278,30 @@ async def queue_depth(
 ) -> dict:
     """Snapshot of how many curated probes have been run, for the UI.
 
-    In 'both' mode, counts are scoped to the current journal cycle
-    (since the most recent publish) — the pair balance the picker
-    actually uses. The baseline/hinted modes use all-time counts."""
-    if set_name == SET_BOTH:
+    In meta-mode (both / agent-both), counts are scoped to the current
+    journal cycle (since the most recent publish) — the pair balance the
+    picker actually uses. The pure baseline/hinted/agent modes use
+    all-time counts."""
+    if set_name in META_SETS:
         since = await _both_balance_since(db_path)
         counts = await _run_counts(db_path, since=since)
-        hinted_per_parent = await _hinted_per_parent(db_path, since=since)
-        parent_to_hinted = hinted_parent_index()
-        # In 'both' mode the unit is the matched pair (each parent
-        # contributes one baseline slot + one hinted slot to the
-        # cycle). Pair-balance = min(baseline_count, hinted_count) per
-        # parent — when those match, the pair is balanced.
+        scaffold_per_parent = await _scaffold_per_parent(
+            db_path, set_name=set_name, since=since
+        )
+        parent_index = _parent_index_for(set_name)
         pair_min_counts = []
         pair_max_counts = []
         runs_at_pair = 0
         total = 0
-        for parent in parent_to_hinted:
+        for parent in parent_index:
             b = counts.get(parent, 0)
-            h = hinted_per_parent.get(parent, 0)
-            pair_min_counts.append(min(b, h))
-            pair_max_counts.append(max(b, h))
-            total += b + h
-            if b > 0 and h > 0:
+            s = scaffold_per_parent.get(parent, 0)
+            pair_min_counts.append(min(b, s))
+            pair_max_counts.append(max(b, s))
+            total += b + s
+            if b > 0 and s > 0:
                 runs_at_pair += 1
-        n_pairs = len(parent_to_hinted)
+        n_pairs = len(parent_index)
         return {
             "curated_total": n_pairs,
             "curated_run_at_least_once": runs_at_pair,

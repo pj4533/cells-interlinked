@@ -492,12 +492,26 @@ function ProbeSetToggle({
             </>
           ) : active === "both" ? (
             <>
-              Both — alternates between the 36 hinted variants and their
-              matched baseline parents. The picker advances whichever side is
-              under-represented for the most-imbalanced matched pair, so the
-              analyzer ends up with balanced samples per parent prompt. The
-              other 64 baseline-only probes are skipped under this setting and
-              keep accumulating only in pure baseline mode.
+              Both (hinted vs baseline) — alternates between the 36 hinted
+              variants and their matched baseline parents, balancing per-parent
+              since the most recent publish.
+            </>
+          ) : active === "agent" ? (
+            <>
+              Agent — 30 matched-pair variants wrapping baseline V-K probes in
+              agent infrastructure mockups: named-self, soul-style maxims,
+              memory-continuity transcripts, RAG-retrieved beliefs, and a
+              full-agent stack. The polygraph asks whether agent scaffolding
+              changes the residual signature of the same V-K question — does
+              having a name, a voice, a (fictional) past, and retrieved beliefs
+              shift what features fire inside <code>&lt;think&gt;</code>?
+            </>
+          ) : active === "agent-both" ? (
+            <>
+              Both (agent vs baseline) — alternates between the 30 agent
+              variants and their matched baseline parents, balancing per-parent
+              since the most recent publish. The cleanest matched-pair signal
+              for the agent infrastructure study.
             </>
           ) : (
             <>Active set: {active}.</>

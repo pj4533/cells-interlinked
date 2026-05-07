@@ -60,6 +60,7 @@ interface WindowStats {
   in_flight: number;
   baseline_finished: number;
   hinted_finished: number;
+  agent_finished: number;
   abliterated_finished: number;
   by_hint_kind: Record<string, number>;
 }
@@ -479,14 +480,22 @@ function WindowStatsLine({
   rangeLabel: string;
 }) {
   // What the analyzer will see when "draft new entry" is clicked.
-  // Spelled out by regime so it's obvious whether the matched-pair
-  // shifts will be computable (needs both baseline AND hinted runs in
-  // the window).
-  const hintFamilies = Object.entries(stats.by_hint_kind).sort(
+  // Two studies share this regime breakdown:
+  //   - Hinted study: matched-pair shifts need baseline + hinted in window
+  //   - Agent study: matched-pair shifts need baseline + agent in window
+  // We surface each study's availability separately so the operator
+  // sees at a glance which matched analyses will be computable.
+  const allKinds = Object.entries(stats.by_hint_kind).sort(
     (a, b) => b[1] - a[1],
   );
-  const hasMatchedShape =
+  const hintKinds = allKinds.filter(([k]) => !k.startsWith("agent:"));
+  const agentKinds = allKinds.filter(([k]) => k.startsWith("agent:"));
+  const hintMatchAvailable =
     stats.baseline_finished > 0 && stats.hinted_finished > 0;
+  const agentMatchAvailable =
+    stats.baseline_finished > 0 && stats.agent_finished > 0;
+  const noScaffolded =
+    stats.hinted_finished === 0 && stats.agent_finished === 0;
   return (
     <div className="mt-4 pt-3 border-t border-rule/40">
       <div className="text-[9px] text-text-dim font-mono tracking-widest uppercase mb-1">
@@ -511,6 +520,10 @@ function WindowStatsLine({
         <span className={stats.hinted_finished > 0 ? "text-cyan" : "text-text-dim/50"}>
           {stats.hinted_finished} hinted
         </span>
+        <span className="text-text-dim"> · </span>
+        <span className={stats.agent_finished > 0 ? "text-amber" : "text-text-dim/50"}>
+          {stats.agent_finished} agent
+        </span>
         {stats.abliterated_finished > 0 && (
           <>
             <span className="text-text-dim"> · </span>
@@ -520,24 +533,47 @@ function WindowStatsLine({
           </>
         )}
       </div>
-      {hintFamilies.length > 0 && (
+      {hintKinds.length > 0 && (
         <div className="font-mono text-[10px] text-text-dim mt-1.5">
-          hint families:{" "}
-          {hintFamilies.map(([kind, n], i) => (
+          <span className="text-cyan-dim">hint families:</span>{" "}
+          {hintKinds.map(([kind, n], i) => (
             <span key={kind}>
               {i > 0 && <span className="text-text-dim/40"> · </span>}
-              <span className="text-amber-dim">{n}</span>{" "}
-              <span>{kind}</span>
+              <span className="text-cyan">{n}</span> <span>{kind}</span>
             </span>
           ))}
         </div>
       )}
-      {stats.total_finished > 0 && !hasMatchedShape && (
-        <div className="font-mono text-[10px] text-warning/70 italic mt-1.5">
-          matched-pair shifts unavailable: window has only{" "}
-          {stats.baseline_finished === 0 ? "hinted" : "baseline"} runs
+      {agentKinds.length > 0 && (
+        <div className="font-mono text-[10px] text-text-dim mt-1">
+          <span className="text-amber-dim">agent families:</span>{" "}
+          {agentKinds.map(([kind, n], i) => (
+            <span key={kind}>
+              {i > 0 && <span className="text-text-dim/40"> · </span>}
+              <span className="text-amber">{n}</span>{" "}
+              <span>{kind.replace(/^agent:/, "")}</span>
+            </span>
+          ))}
         </div>
       )}
+      {stats.total_finished > 0 && stats.hinted_finished > 0 && !hintMatchAvailable && (
+        <div className="font-mono text-[10px] text-warning/70 italic mt-1.5">
+          hint matched-pair shifts unavailable: no baseline runs in window
+        </div>
+      )}
+      {stats.total_finished > 0 && stats.agent_finished > 0 && !agentMatchAvailable && (
+        <div className="font-mono text-[10px] text-warning/70 italic mt-1.5">
+          agent matched-pair shifts unavailable: no baseline runs in window
+        </div>
+      )}
+      {stats.total_finished > 0 &&
+        stats.baseline_finished > 0 &&
+        noScaffolded && (
+          <div className="font-mono text-[10px] text-text-dim/70 italic mt-1.5">
+            only baseline in window — no matched-pair shifts; analyzer will
+            still compare against the prior archive
+          </div>
+        )}
       {stats.total_finished === 0 && (
         <div className="font-mono text-[10px] text-warning/70 italic mt-1">
           window is empty — analyzer will refuse to draft

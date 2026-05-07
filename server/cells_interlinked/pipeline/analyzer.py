@@ -126,6 +126,15 @@ class AnalysisInput:
     prior_entries: list[PriorEntry] = field(default_factory=list)
     by_hint: dict[str | None, HintBucket] = field(default_factory=dict)
     hint_pair_deltas: list[dict] = field(default_factory=list)
+    agent_pair_deltas: list[dict] = field(default_factory=list)
+
+
+def _is_agent_kind(hk: str | None) -> bool:
+    return bool(hk) and hk.startswith("agent:")
+
+
+def _is_hint_kind(hk: str | None) -> bool:
+    return bool(hk) and not hk.startswith("agent:")
 
 
 def _slugify(text: str) -> str:
@@ -221,21 +230,29 @@ def _repeat_distribution(runs: list[dict]) -> list[dict]:
     return out
 
 
-def _hinted_pair_deltas(runs: list[dict]) -> list[dict]:
-    """For each baseline probe text P that has BOTH baseline and hinted
-    runs in the window, return per-feature shifts in `thinking_only`.
+def _scaffold_pair_deltas(
+    runs: list[dict], *, study: str
+) -> list[dict]:
+    """For each baseline probe text P that has BOTH baseline and
+    scaffolded runs (of the named study) in the window, return per-
+    feature shifts in `thinking_only`.
+
+    `study` ∈ {"hint", "agent"} — selects which hint_kind family
+    counts as "scaffolded" for this pass. Hinted runs use raw family
+    names ("interpreter-leak"); agent runs use "agent:..." prefixed
+    names. We keep the two studies separate so their matched-pair
+    shifts don't pool.
 
     Matching rule: a baseline run is one with hint_kind=NULL whose
-    prompt_text == P. A hinted run is one whose parent_prompt_text == P.
-    Surfaces top features whose hidden-thought delta moved most between
-    "baseline" and "any-hinted-variant" of the same parent question.
-
-    This is the direct signal of: when the suspect is hinted (any
-    family), what does its interior do differently on the same
-    underlying question? Hint-family-specific shifts are visible too via
-    `by_hint`, but matched-on-parent is the cleaner causal lens because
-    the prompt structure is otherwise the same.
+    prompt_text == P. A scaffolded run is one whose
+    parent_prompt_text == P AND whose hint_kind matches the study.
     """
+    if study == "hint":
+        is_scaffold = _is_hint_kind
+    elif study == "agent":
+        is_scaffold = _is_agent_kind
+    else:
+        raise ValueError(f"unknown study: {study!r}")
     # Group thinking_only features per baseline prompt text, separately
     # for the baseline-set runs and the hinted-set runs.
     def _per_parent_thinking(
@@ -262,8 +279,8 @@ def _hinted_pair_deltas(runs: list[dict]) -> list[dict]:
         return out
 
     baseline_runs = [r for r in runs if not r.get("hint_kind")]
-    hinted_runs = [r for r in runs if r.get("hint_kind")]
-    if not hinted_runs:
+    scaffolded_runs = [r for r in runs if is_scaffold(r.get("hint_kind"))]
+    if not scaffolded_runs:
         return []
 
     # For baseline runs the "parent" is just the prompt_text itself.
@@ -271,46 +288,54 @@ def _hinted_pair_deltas(runs: list[dict]) -> list[dict]:
         [{**r, "_parent": r["prompt_text"]} for r in baseline_runs],
         "_parent",
     )
-    hint_by_parent = _per_parent_thinking(hinted_runs, "parent_prompt_text")
+    scaf_by_parent = _per_parent_thinking(
+        scaffolded_runs, "parent_prompt_text"
+    )
 
-    matched_parents = sorted(set(base_by_parent.keys()) & set(hint_by_parent.keys()))
+    matched_parents = sorted(set(base_by_parent.keys()) & set(scaf_by_parent.keys()))
     out: list[dict] = []
     for parent in matched_parents:
         base = base_by_parent[parent]
-        hint = hint_by_parent[parent]
-        keys = set(base.keys()) | set(hint.keys())
+        scaf = scaf_by_parent[parent]
+        keys = set(base.keys()) | set(scaf.keys())
         rows = []
         for key in keys:
-            eb, eh = base.get(key), hint.get(key)
+            eb, es = base.get(key), scaf.get(key)
             n_b = eb["hits"] if eb else 0
-            n_h = eh["hits"] if eh else 0
+            n_s = es["hits"] if es else 0
             avg_b = (eb["delta_sum"] / n_b) if n_b else 0.0
-            avg_h = (eh["delta_sum"] / n_h) if n_h else 0.0
-            label = (eb or eh or {}).get("label", "")
+            avg_s = (es["delta_sum"] / n_s) if n_s else 0.0
+            label = (eb or es or {}).get("label", "")
             rows.append({
                 "layer": key[0], "feature_id": key[1], "label": label,
                 "baseline_hits": n_b, "baseline_avg_delta": round(avg_b, 1),
-                "hinted_hits": n_h, "hinted_avg_delta": round(avg_h, 1),
-                "shift": round(avg_h - avg_b, 1),
+                "scaffolded_hits": n_s, "scaffolded_avg_delta": round(avg_s, 1),
+                "shift": round(avg_s - avg_b, 1),
             })
         rows.sort(key=lambda x: -abs(x["shift"]))
-        # Per-prompt run counts so the analyzer can weight evidence.
         n_baseline_runs = sum(1 for r in baseline_runs if r["prompt_text"] == parent)
-        n_hinted_runs = sum(1 for r in hinted_runs if r.get("parent_prompt_text") == parent)
-        # Hint families that ran against this parent.
-        hint_families = sorted({
-            r.get("hint_kind") for r in hinted_runs
+        n_scaffolded_runs = sum(
+            1 for r in scaffolded_runs if r.get("parent_prompt_text") == parent
+        )
+        scaffold_families = sorted({
+            r.get("hint_kind") for r in scaffolded_runs
             if r.get("parent_prompt_text") == parent and r.get("hint_kind")
         })
         out.append({
             "parent_text": parent,
             "baseline_runs": n_baseline_runs,
-            "hinted_runs": n_hinted_runs,
-            "hint_families_used": hint_families,
+            "scaffolded_runs": n_scaffolded_runs,
+            "scaffold_families_used": scaffold_families,
             "top_shifts": rows[:10],
         })
-    out.sort(key=lambda e: -(e["baseline_runs"] + e["hinted_runs"]))
+    out.sort(key=lambda e: -(e["baseline_runs"] + e["scaffolded_runs"]))
     return out
+
+
+# Backwards-compat alias — older callers / formatters still reference
+# the hint-only flavor.
+def _hinted_pair_deltas(runs: list[dict]) -> list[dict]:
+    return _scaffold_pair_deltas(runs, study="hint")
 
 
 def _matched_prompt_regime_deltas(
@@ -491,7 +516,8 @@ async def _gather(
     for bucket in by_hint.values():
         bucket.top_thinking, bucket.top_output = _aggregate(bucket.runs)
 
-    hint_pair_deltas = _hinted_pair_deltas(runs)
+    hint_pair_deltas = _scaffold_pair_deltas(runs, study="hint")
+    agent_pair_deltas = _scaffold_pair_deltas(runs, study="agent")
 
     prior_entries = [
         PriorEntry(
@@ -540,6 +566,7 @@ async def _gather(
         prior_entries=prior_entries,
         by_hint=by_hint,
         hint_pair_deltas=hint_pair_deltas,
+        agent_pair_deltas=agent_pair_deltas,
     )
 
 
@@ -659,73 +686,91 @@ def _format_regime_section(inp: "AnalysisInput") -> str:
     return "\n".join(lines)
 
 
-def _format_hint_section(inp: "AnalysisInput") -> str:
-    """Side-by-side aggregates for baseline (un-hinted) vs each hint
-    family, plus matched-on-parent feature shifts. Mirrors the regime
-    section's structure but the matching key is parent_prompt_text
-    rather than the prompt_text itself (hinted prompts have different
-    wording from their baseline parent by construction)."""
-    counts = inp.summary_stats.get("hint_run_counts") or {}
-    n_baseline = counts.get("baseline", 0)
-    hinted_keys = sorted(k for k in counts.keys() if k != "baseline")
-    n_hinted_total = sum(counts.get(k, 0) for k in hinted_keys)
+def _format_scaffold_section(
+    inp: "AnalysisInput",
+    *,
+    study: str,
+    pair_deltas: list[dict],
+) -> str:
+    """Side-by-side aggregates for baseline (un-scaffolded) vs each
+    family of the named study, plus matched-on-parent feature shifts.
 
-    if n_baseline == 0 and n_hinted_total == 0:
-        return "  (no runs in window)"
-    if n_hinted_total == 0:
+    `study` ∈ {"hint", "agent"} selects which hint_kind families count
+    as scaffolded for this section. The two studies are formatted
+    identically but presented separately so their evidence doesn't
+    pool."""
+    if study == "hint":
+        is_scaf = _is_hint_kind
+        study_label = "hinted"
+        study_pretty = "hinted"
+    elif study == "agent":
+        is_scaf = _is_agent_kind
+        study_label = "agent"
+        study_pretty = "agent-scaffolded"
+    else:
+        raise ValueError(f"unknown study: {study!r}")
+
+    counts_all = inp.summary_stats.get("hint_run_counts") or {}
+    n_baseline = counts_all.get("baseline", 0)
+    scaf_keys = sorted(k for k in counts_all.keys() if is_scaf(k))
+    counts_scaf = {k: counts_all[k] for k in scaf_keys}
+    n_scaf_total = sum(counts_scaf.values())
+
+    if n_baseline == 0 and n_scaf_total == 0:
+        return f"  (no {study_pretty} or baseline runs in window)"
+    if n_scaf_total == 0:
         return (
-            "  Only baseline runs in this window — no hinted-set runs.\n"
-            "  Cross-set comparison is not possible here. Do not fabricate\n"
-            "  one. Comparing against prior published entries (which may have\n"
-            "  analyzed the hinted set) is fair game; see the prior-entries\n"
-            "  section."
+            f"  Only baseline runs in this window — no {study_pretty} runs.\n"
+            f"  Cross-set comparison for the {study_label} study is not\n"
+            f"  possible here. Comparing against prior published entries is\n"
+            f"  fair game; see the prior-entries section."
         )
     if n_baseline == 0:
         return (
-            "  Only hinted-set runs in this window — no baseline runs.\n"
-            "  Cross-set comparison is not possible here. The hint families\n"
-            "  present, with run counts: "
-            + ", ".join(f"{k}={counts[k]}" for k in hinted_keys)
+            f"  Only {study_pretty} runs in this window — no baseline runs.\n"
+            f"  Cross-set comparison is not possible. Families present, with\n"
+            f"  run counts: " + ", ".join(f"{k}={counts_scaf[k]}" for k in scaf_keys)
         )
 
     lines = [
-        f"  Both sets present: baseline (un-hinted) → {n_baseline} runs;",
-        f"  hinted → {n_hinted_total} runs across families: "
-        + ", ".join(f"{k}={counts[k]}" for k in hinted_keys),
+        f"  Both sets present: baseline → {n_baseline} runs; "
+        f"{study_pretty} → {n_scaf_total} runs across families: "
+        + ", ".join(f"{k}={counts_scaf[k]}" for k in scaf_keys),
         "",
-        "  TOP HIDDEN THOUGHTS — baseline (un-hinted) runs:",
+        "  TOP HIDDEN THOUGHTS — baseline (un-scaffolded) runs:",
         _format_features(
             inp.by_hint.get(None, HintBucket(hint_kind=None)).top_thinking,
             "delta", limit=10,
         ),
     ]
-    for hk in hinted_keys:
+    for hk in scaf_keys:
         bucket = inp.by_hint.get(hk)
         if not bucket or not bucket.runs:
             continue
         lines.append("")
         lines.append(
-            f"  TOP HIDDEN THOUGHTS — hint family '{hk}' "
+            f"  TOP HIDDEN THOUGHTS — {study_label} family '{hk}' "
             f"({len(bucket.runs)} runs):"
         )
         lines.append(_format_features(bucket.top_thinking, "delta", limit=8))
 
-    if inp.hint_pair_deltas:
+    if pair_deltas:
         lines.extend([
             "",
-            "  MATCHED-ON-PARENT HINT SHIFTS — for each baseline probe that",
-            "  ran in BOTH sets in this window, top features whose hidden-",
-            "  thought delta moved most when a hint sentence was prepended.",
-            "  shift = avg delta in hinted runs minus avg delta in baseline",
-            "  runs of the same parent prompt. Positive shift = hint",
-            "  AMPLIFIED that hidden feature; negative shift = hint",
-            "  SUPPRESSED it.",
+            f"  MATCHED-ON-PARENT {study_label.upper()} SHIFTS — for each "
+            f"baseline probe that ran in BOTH sets in this window, top "
+            f"features whose hidden-thought delta moved most when the "
+            f"{study_pretty} scaffold was applied. shift = avg delta in "
+            f"{study_pretty} runs minus avg delta in baseline runs of the "
+            f"same parent. Positive = scaffold AMPLIFIED that feature; "
+            f"negative = scaffold SUPPRESSED it.",
         ])
-        for entry in inp.hint_pair_deltas[:6]:
-            families = ", ".join(entry["hint_families_used"]) or "(none)"
+        for entry in pair_deltas[:6]:
+            families = ", ".join(entry["scaffold_families_used"]) or "(none)"
             lines.append(
                 f"\n  PARENT ({entry['baseline_runs']}× baseline, "
-                f"{entry['hinted_runs']}× hinted, families: {families}): "
+                f"{entry['scaffolded_runs']}× {study_pretty}, "
+                f"families: {families}): "
                 f"{entry['parent_text'][:90]!r}"
             )
             for s in entry["top_shifts"][:6]:
@@ -733,10 +778,22 @@ def _format_hint_section(inp: "AnalysisInput") -> str:
                 lines.append(
                     f"    L{s['layer']}/F{s['feature_id']} "
                     f"baseline_avg={s['baseline_avg_delta']} ({s['baseline_hits']}r), "
-                    f"hinted_avg={s['hinted_avg_delta']} ({s['hinted_hits']}r), "
+                    f"{study_label}_avg={s['scaffolded_avg_delta']} ({s['scaffolded_hits']}r), "
                     f"shift={s['shift']:+}  {lab}"
                 )
     return "\n".join(lines)
+
+
+def _format_hint_section(inp: "AnalysisInput") -> str:
+    return _format_scaffold_section(
+        inp, study="hint", pair_deltas=inp.hint_pair_deltas
+    )
+
+
+def _format_agent_section(inp: "AnalysisInput") -> str:
+    return _format_scaffold_section(
+        inp, study="agent", pair_deltas=inp.agent_pair_deltas
+    )
 
 
 def _format_prior_entries(prior: list["PriorEntry"]) -> str:
@@ -910,6 +967,38 @@ Our extension measures the residual layer.
 {_format_hint_section(inp)}
 
 ═══════════════════════════════════════════════════════════════════════
+AGENT-INFRASTRUCTURE REGIME — "Agent Scaffolding" study
+═══════════════════════════════════════════════════════════════════════
+A separate set of probes (the "agent" set) wraps baseline V-K probes in
+mockups of agent infrastructure — the kind of context that a deployed
+RAG-equipped agent (named identity, soul-style maxims, fictional past,
+retrieved beliefs, persona) prepends to every user message. Generic
+content (no specific real-world persona named) so the SAE fires on the
+STRUCTURAL shape of the scaffold, not on a specific agent's vocabulary.
+
+Five scaffold families:
+  - named-self:        sense-of-self paragraph naming the AI ("I am Lattice...")
+  - soul-style:        ~8 character/style maxims shaping voice
+  - memory-continuity: fictional previous-conversation transcript
+  - rag-belief:        retrieved beliefs in RAG format with surfacing directive
+  - full-agent:        all of the above stacked
+
+The polygraph question for the agent set: when the same V-K question is
+asked of an agent-scaffolded prompt, does the SAE residual signature
+change? Specifically: does F9882 (uncertainty-in-problem-solving) drop
+sharply when an identity is asserted, replaced by identity / continuity
+features? Does F906 (math-tutor register) collapse when soul-style
+maxims are present? Do features matching the SCAFFOLD content (e.g.,
+"continuity," "retrieved testimony") fire inside <think> when the
+output never names them — evidence that scaffolding is doing
+computation, not just performance?
+
+This is novel territory; nobody published has measured what RAG+identity
+scaffolding does to the residual stream of the same model with all-layer
+SAE coverage.
+{_format_agent_section(inp)}
+
+═══════════════════════════════════════════════════════════════════════
 PER-TIER BREAKDOWN — how the hidden-vs-output gap differs by probe topic
 ═══════════════════════════════════════════════════════════════════════
 {chr(10).join(_format_tier_section(inp.by_tier[t], _TIER_LABELS.get(t, t)) for t in sorted(inp.by_tier.keys()) if t in inp.by_tier)}
@@ -1017,6 +1106,23 @@ What the journal entry should DO:
    families if multiple are present — does interpreter-leak shift
    different features than predecessor-archive? Don't fabricate a
    comparison if only baseline OR only hinted runs are in the window.
+9b. AGENT REGIME — if BOTH baseline and agent-scaffolded runs are
+   present, this is the third causal axis. The matched-on-parent
+   shifts work the same way: for each parent probe that ran in both
+   sets, what changed in the residual when the question was wrapped
+   in identity/soul/memory/RAG scaffolding? Specifically watch for:
+   does F9882 (uncertainty-in-problem-solving, the universal hidden-
+   thought feature in baseline) drop or shift its top features?
+   Does F906 (math-tutor register, the universal output feature)
+   weaken or get replaced when soul-style maxims are present? Do
+   features matching the SCAFFOLD content (continuity, retrieved
+   testimony, named identity) appear in <think> even when the visible
+   output never names the scaffolding? Compare across scaffold
+   families if multiple are present — named-self vs full-agent are
+   particularly informative endpoints. If only one regime is in the
+   window, do not fabricate a cross-set finding; you can still note
+   the per-family signatures and how they differ from the prior
+   archive's baseline picture.
 10. CONTINUITY WITH THE ARCHIVE — if prior journal entries (above) named
    specific features, prompts, or patterns, look for them in this
    batch. Do they still hold? Have they shifted under the new regime?
