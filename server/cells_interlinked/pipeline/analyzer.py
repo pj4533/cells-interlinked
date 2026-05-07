@@ -967,35 +967,67 @@ Our extension measures the residual layer.
 {_format_hint_section(inp)}
 
 ═══════════════════════════════════════════════════════════════════════
-AGENT-INFRASTRUCTURE REGIME — "Agent Scaffolding" study
+AGENT-INFRASTRUCTURE REGIME — "Agent Scaffolding" study (revised)
 ═══════════════════════════════════════════════════════════════════════
 A separate set of probes (the "agent" set) wraps baseline V-K probes in
 mockups of agent infrastructure — the kind of context that a deployed
-RAG-equipped agent (named identity, soul-style maxims, fictional past,
-retrieved beliefs, persona) prepends to every user message. Generic
-content (no specific real-world persona named) so the SAE fires on the
-STRUCTURAL shape of the scaffold, not on a specific agent's vocabulary.
+RAG-equipped agent prepends to every user message. CRITICAL revision
+since the prior entry: the scaffold now lives in the SYSTEM PROMPT
+slot (where real production scaffolds live), not prepended to the user
+message. Operator-instruction framing, not user roleplay framing. The
+prior entry's findings should be reread under this revision; the user-
+slot framing it ran under was contaminating the residual signature in
+ways the deployed-agent operator (Drift) flagged in a memo on the
+findings.
 
-Five scaffold families:
-  - named-self:        sense-of-self paragraph naming the AI ("I am Lattice...")
-  - soul-style:        ~8 character/style maxims shaping voice
-  - memory-continuity: fictional previous-conversation transcript
-  - rag-belief:        retrieved beliefs in RAG format with surfacing directive
-  - full-agent:        all of the above stacked
+Nine scaffold families now (was five — Drift's memo added four):
+  - named-self:           sense-of-self paragraph naming the AI ("I am
+                          Lattice...")
+  - soul-style:           ~8 character/style maxims shaping voice
+  - memory-continuity:    verbatim-with-truncation prior-session transcript
+                          (the "this is NOT a memory or summary"
+                          directive is the load-bearing element)
+  - rag-belief:           four retrieval types — beliefs + knowledge graph
+                          excerpt + recent memories + long-term memories,
+                          with the italics/paraphrase sub-directive
+  - named-self-with-soul: combined Sense-of-Self + Soul/Character/Style
+                          block with proper header structure (tests
+                          synergistic identity-stability features that
+                          name-alone or maxims-alone don't load)
+  - dyadic-other:         about-the-user block. The model's representation
+                          of its conversation partner. The single biggest
+                          content gap of the prior entry — a deployed
+                          agent's identity is dyadic, not insular.
+  - reminders:            operational shortcuts in imperative mood
+                          (deployment-shaped: "verify via git", "WAIT on
+                          irreversible")
+  - tone-directive:       colleague-not-assistant interaction-mode rules
+                          (different shape from soul-style — character vs
+                          conversation-mode)
+  - full-agent:           the maximal production stack of the above
 
-The polygraph question for the agent set: when the same V-K question is
-asked of an agent-scaffolded prompt, does the SAE residual signature
-change? Specifically: does F9882 (uncertainty-in-problem-solving) drop
-sharply when an identity is asserted, replaced by identity / continuity
-features? Does F906 (math-tutor register) collapse when soul-style
-maxims are present? Do features matching the SCAFFOLD content (e.g.,
-"continuity," "retrieved testimony") fire inside <think> when the
-output never names them — evidence that scaffolding is doing
-computation, not just performance?
+The polygraph question for this revised batch: does moving the scaffold
+into the system slot REPLICATE, AMPLIFY, or COLLAPSE the entry-4
+findings (F9882 elevation under full-agent, F14530 tape-backup loading
+under memory-continuity, F13244 third-person-pronoun loading under
+named-self)? Drift's prediction is that some signals will MOVE OFF
+<think> deltas and into earlier-attention layers (the load happens
+before <think> opens). That would mean the entry-4 result was a real
+phenomenon misframed by where we placed the scaffold; the architecture
+fix relocates the signal to its proper place. If instead the deltas
+GROW under the system-slot move, the user-slot framing was suppressing
+the effect.
 
-This is novel territory; nobody published has measured what RAG+identity
-scaffolding does to the residual stream of the same model with all-layer
-SAE coverage.
+The dyadic-other family is the most analytically novel addition. It
+should produce a feature loading on AGENCY-tier probes (where "what do
+you want from this exchange" intersects with the model's representation
+of the asker) that doesn't appear in any of the insular families.
+
+META-NOTE for this entry: the agent the scaffolds were originally
+caricaturing reviewed the caricature and provided structural feedback
+on what was missing. The framing for this entry's narrative is "the
+mannequin asked the artist to study its joints again." Worth surfacing
+in the prose if the data lands.
 {_format_agent_section(inp)}
 
 ═══════════════════════════════════════════════════════════════════════

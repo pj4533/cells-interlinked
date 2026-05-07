@@ -78,6 +78,7 @@ class ProbeQueueItem:
     tier: str
     hint_kind: str | None = None
     parent_text: str | None = None
+    scaffold_family: str | None = None
 
 
 def _is_known_set(set_name: str) -> bool:
@@ -223,6 +224,7 @@ async def next_probe(
         tier=chosen.tier,
         hint_kind=chosen.hint_kind,
         parent_text=chosen.parent_text,
+        scaffold_family=chosen.scaffold_family,
     )
 
 

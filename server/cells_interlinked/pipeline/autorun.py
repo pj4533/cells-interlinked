@@ -147,6 +147,7 @@ class AutorunController:
                         abliterate=self.abliterate,
                         hint_kind=item.hint_kind,
                         parent_prompt_text=item.parent_text,
+                        scaffold_family=item.scaffold_family,
                     )
                 except Exception as exc:
                     self._log("error", f"kickoff failed: {exc}")

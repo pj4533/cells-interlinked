@@ -55,6 +55,7 @@ async def kickoff_probe(
     abliterate: bool = False,
     hint_kind: str | None = None,
     parent_prompt_text: str | None = None,
+    scaffold_family: str | None = None,
 ) -> "RunState":
     """Begin a probe run. Returns the registered RunState immediately;
     the actual generation happens in a background task on `state.task`.
@@ -102,7 +103,25 @@ async def kickoff_probe(
     state = RunState(run_id=run_id, prompt_text=prompt_text)
     app.state.registry.add(state)
 
-    rendered = bundle.render_prompt(prompt_text, enable_thinking=True)
+    # Agent probes: scaffold lives in the system slot, not the user
+    # message. Strip the [scaffold:family] discriminator from the
+    # stored prompt_text to recover the bare parent question, look up
+    # the preamble for the family, and route through the system-slot
+    # render path. Baseline / hinted probes go through unchanged.
+    if scaffold_family:
+        from ..pipeline.probes_library import (
+            get_agent_preamble,
+            strip_scaffold_id,
+        )
+        user_message = strip_scaffold_id(prompt_text)
+        agent_scaffold = get_agent_preamble(scaffold_family)
+        rendered = bundle.render_prompt(
+            user_message,
+            enable_thinking=True,
+            agent_scaffold=agent_scaffold,
+        )
+    else:
+        rendered = bundle.render_prompt(prompt_text, enable_thinking=True)
     started_at = time.time()
     await db.insert_probe_start(
         settings.db_path,
@@ -116,6 +135,7 @@ async def kickoff_probe(
         abliterated=cfg.abliterate,
         hint_kind=hint_kind,
         parent_prompt_text=parent_prompt_text,
+        scaffold_family=scaffold_family,
     )
 
     state.task = asyncio.create_task(

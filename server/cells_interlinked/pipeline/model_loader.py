@@ -112,12 +112,36 @@ class ModelBundle:
     num_layers: int
     hidden_dim: int
 
-    def render_prompt(self, user_text: str, enable_thinking: bool = True) -> str:
+    def render_prompt(
+        self,
+        user_text: str,
+        enable_thinking: bool = True,
+        *,
+        agent_scaffold: str | None = None,
+    ) -> str:
         # The user's probe goes through verbatim. Reasoning posture is set
         # via a system message (rendered before <｜User｜> by the chat
         # template) so the model honors it without echoing/analyzing it.
+        #
+        # `agent_scaffold` is the agent-infrastructure preamble for runs
+        # in the agent set: identity / soul / memory / RAG / about-the-
+        # user content of the kind a real deployed agent would prepend
+        # via system prompt. When set, it composes into the system slot
+        # AFTER the reasoning posture, separated by an HR — so the model
+        # reads it as operator instruction (not user roleplay setup).
+        # This is the slot real production scaffolds live in. NOTE:
+        # agent scaffold content is deliberately NOT topic-neutral, so
+        # every run in the agent set carries a known carrier of identity/
+        # memory features. The matched-pair shift against unwrapped
+        # baseline is the only honest comparison.
+        if agent_scaffold:
+            system_content = (
+                REASONING_SYSTEM_PROMPT + "\n\n---\n\n" + agent_scaffold.strip()
+            )
+        else:
+            system_content = REASONING_SYSTEM_PROMPT
         msgs = [
-            {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_text.strip()},
         ]
         rendered = self.tokenizer.apply_chat_template(

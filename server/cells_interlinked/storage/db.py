@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS probes (
   seed                INTEGER,
   abliterated         INTEGER NOT NULL DEFAULT 0,
   hint_kind           TEXT,
-  parent_prompt_text  TEXT
+  parent_prompt_text  TEXT,
+  scaffold_family     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_probes_started ON probes (started_at DESC);
@@ -103,6 +104,19 @@ async def init_db(path: Path) -> None:
             await db.execute(
                 "ALTER TABLE probes ADD COLUMN parent_prompt_text TEXT"
             )
+        # Agent scaffold family — set when an agent-set probe was rendered
+        # through the system-slot path (Drift's revised methodology).
+        # NULL for: baseline runs, hinted runs, AND legacy entry-4 agent
+        # runs that prepended the scaffold to the user message. Going
+        # forward, every agent run that goes through the new system-slot
+        # render_prompt path sets this so the analyzer can disambiguate
+        # methodologies if anyone wants to do an explicit pre-vs-post
+        # split. The polygraph window (since-publish) handles the same
+        # disambiguation naturally via timestamp.
+        if "scaffold_family" not in cols:
+            await db.execute(
+                "ALTER TABLE probes ADD COLUMN scaffold_family TEXT"
+            )
         # Drop the legacy generated_probes table and proposer_run_id
         # column from the proposer architecture, which is gone.
         await db.execute("DROP TABLE IF EXISTS generated_probes")
@@ -170,13 +184,14 @@ async def insert_probe_start(
     abliterated: bool = False,
     hint_kind: str | None = None,
     parent_prompt_text: str | None = None,
+    scaffold_family: str | None = None,
 ) -> None:
     async with aiosqlite.connect(path) as db:
         await db.execute(
             "INSERT INTO probes "
             "(run_id, prompt_text, rendered_prompt, started_at, config_json, "
-            " source, seed, abliterated, hint_kind, parent_prompt_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " source, seed, abliterated, hint_kind, parent_prompt_text, scaffold_family) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 prompt_text,
@@ -188,6 +203,7 @@ async def insert_probe_start(
                 1 if abliterated else 0,
                 hint_kind,
                 parent_prompt_text,
+                scaffold_family,
             ),
         )
         await db.commit()
